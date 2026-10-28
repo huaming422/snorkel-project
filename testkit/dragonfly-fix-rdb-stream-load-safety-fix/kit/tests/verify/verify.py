@@ -218,17 +218,29 @@ def _build_cgroup_stream_dump(global_pel, consumers) -> bytes:
     return _wrap_dump_footer(bytes(p))
 
 
-def _build_listpack_stream_dump(count, deleted, num_master_fields, record_flags=None) -> bytes:
+def _build_listpack_stream_dump(count, deleted, num_master_fields, record_flags=None,
+                                lp_tail: bytes = b"") -> bytes:
     """One-node stream whose master-entry listpack declares the given counts.
-    When ``record_flags`` is set, a single record (no fields) is appended so
-    the declared deleted-count can be made to disagree with the flags present.
+    When ``record_flags`` is set (one flag value or a list of them), one
+    record with no fields is appended per flag value, so the declared
+    deleted-count can be made to disagree with the flags present.
+    When ``lp_tail`` is set, those bytes and a second LP_EOF follow the
+    listpack's own LP_EOF, and the header byte count covers them, so the
+    listpack ends early inside its declared size.
     Mirrors the master-entry listpack layout:
     [valid-count, deleted-count, num-master-fields, 0 terminator, ...records]."""
     ints = [count, deleted, num_master_fields, 0]
     if record_flags is not None:
         assert num_master_fields == 0
-        ints += [record_flags, 0, 0, 3]  # flags, ms delta, seq delta, lp-count
+        if isinstance(record_flags, int):
+            record_flags = [record_flags]
+        for flags in record_flags:
+            ints += [flags, 0, 0, 3]  # flags, ms delta, seq delta, lp-count
     lp_blob = _build_listpack(ints)
+    if lp_tail:
+        lp_blob = bytearray(lp_blob + lp_tail + b"\xff")
+        struct.pack_into("<I", lp_blob, 0, len(lp_blob))
+        lp_blob = bytes(lp_blob)
 
     p = bytearray()
     p.append(RDB_TYPE_STREAM_LISTPACKS)
@@ -430,99 +442,106 @@ def _restore_is_rejected(port: int, key: str, payload: bytes) -> tuple[bool, byt
 # A 16-byte stream id, raw bytes as stored in the PEL.
 _ID_A = b"A" * 16
 _ID_B = b"B" * 16
+_ID_C = b"C" * 16
 
 
-# ── fail_to_pass: malformed stream values must be rejected on load ──────────
+# ── Malformed stream values are rejected on load ───────────────────────────
+
+def _assert_all_rejected(port: int, label: str, cases) -> None:
+    """RESTORE each (key, payload) pair and require the rejection contract for
+    every one of them. The variants differ in key name and in the ids, names or
+    counts they carry, so only the shape of the value decides the outcome."""
+    for key, payload in cases:
+        rejected, restore, exists, alive = _restore_is_rejected(port, key, payload)
+        assert alive, (
+            f"server did not survive loading a {label} stream (key {key!r}): "
+            f"RESTORE reply={restore!r}"
+        )
+        assert rejected, (
+            f"{label} stream was not safely rejected (key {key!r}): "
+            f"RESTORE reply={restore!r} EXISTS={exists!r} server_alive={alive}"
+        )
+
 
 def test_pel_shared_entry_rejected(dragonfly_port: int):
-    """Two consumers both claim the same global-PEL entry. Accepting this
-    shares one bookkeeping structure across both consumer PELs, and the
-    structure is freed twice when the key is torn down. The value has to be
-    rejected at load."""
-    payload = _build_cgroup_stream_dump([_ID_A], [(b"c1", [_ID_A]), (b"c2", [_ID_A])])
-    rejected, restore, exists, alive = _restore_is_rejected(dragonfly_port, "shared", payload)
-    assert rejected, (
-        f"shared-PEL-entry stream was not safely rejected: "
-        f"RESTORE reply={restore!r} EXISTS={exists!r} server_alive={alive}"
-    )
+    """Two consumers both claim the same global-PEL entry. RESTORE has to
+    reply with an error, the key must not exist and the server keeps serving.
+    The last variant has the second consumer claim a free entry first and the
+    taken one after it."""
+    _assert_all_rejected(dragonfly_port, "shared-PEL-entry", [
+        ("shared", _build_cgroup_stream_dump(
+            [_ID_A], [(b"c1", [_ID_A]), (b"c2", [_ID_A])])),
+        ("pel-dup-owner", _build_cgroup_stream_dump(
+            [_ID_B], [(b"alice", [_ID_B]), (b"bob", [_ID_B])])),
+        ("pel-late-claim", _build_cgroup_stream_dump(
+            [_ID_A, _ID_C], [(b"c1", [_ID_A]), (b"c2", [_ID_C, _ID_A])])),
+    ])
 
 
 def test_pel_unclaimed_entry_rejected(dragonfly_port: int):
-    """A global-PEL entry that no consumer claims leaves a dangling owner
-    pointer for later stream commands to dereference. Reject it at load."""
-    payload = _build_cgroup_stream_dump([_ID_A], [(b"c1", [])])
-    rejected, restore, exists, alive = _restore_is_rejected(dragonfly_port, "unclaimed", payload)
-    assert rejected, (
-        f"unclaimed-PEL-entry stream was not safely rejected: "
-        f"RESTORE reply={restore!r} EXISTS={exists!r} server_alive={alive}"
-    )
+    """A global-PEL entry that no consumer claims. RESTORE has to reply with
+    an error, the key must not exist and the server keeps serving. The last
+    variant claims one of two entries and leaves the other one ownerless."""
+    _assert_all_rejected(dragonfly_port, "unclaimed-PEL-entry", [
+        ("unclaimed", _build_cgroup_stream_dump([_ID_A], [(b"c1", [])])),
+        ("pel-orphan", _build_cgroup_stream_dump([_ID_B], [(b"alice", [])])),
+        ("pel-half-claimed", _build_cgroup_stream_dump(
+            [_ID_A, _ID_B], [(b"c1", [_ID_A])])),
+    ])
 
 
 def test_listpack_fieldcount_overflow_rejected(dragonfly_port: int):
     """The master entry declares far more fields than the listpack holds.
-    Iterating such a node walks off the end of the listpack, so the value has
-    to be rejected before that happens and the server has to stay up."""
-    payload = _build_listpack_stream_dump(0, 0, 1000)
-    rejected, restore, exists, alive = _restore_is_rejected(dragonfly_port, "overflow", payload)
-    assert alive, (
-        f"server did not survive loading a stream with an inflated field count "
-        f"(it crashed during the load): RESTORE reply={restore!r}"
-    )
-    assert rejected, (
-        f"inflated-field-count stream was not safely rejected: "
-        f"RESTORE reply={restore!r} EXISTS={exists!r} server_alive={alive}"
-    )
+    The server has to survive the RESTORE, reply with an error and leave no
+    key behind."""
+    _assert_all_rejected(dragonfly_port, "inflated-field-count", [
+        ("overflow", _build_listpack_stream_dump(0, 0, 1000)),
+        ("fields-3000", _build_listpack_stream_dump(0, 0, 3000)),
+        ("fields-100000", _build_listpack_stream_dump(0, 0, 100000)),
+    ])
 
 
 def test_listpack_sum_overflow_rejected(dragonfly_port: int):
-    """The declared valid + deleted record counts are chosen so their signed
-    sum overflows. Summing them as a signed value wraps negative and skips the
-    record walk entirely. The value has to be rejected."""
-    payload = _build_listpack_stream_dump((1 << 63) - 1, 1, 0)
-    rejected, restore, exists, alive = _restore_is_rejected(dragonfly_port, "sumovf", payload)
-    assert alive, (
-        f"server did not survive loading a stream with overflowing counts: "
-        f"RESTORE reply={restore!r}"
-    )
-    assert rejected, (
-        f"count-sum-overflow stream was not safely rejected: "
-        f"RESTORE reply={restore!r} EXISTS={exists!r} server_alive={alive}"
-    )
+    """The master entry declares valid and deleted record counts that add up
+    past INT64_MAX, far more records than the listpack holds. The server has
+    to survive the RESTORE, reply with an error and leave no key behind."""
+    _assert_all_rejected(dragonfly_port, "count-sum-overflow", [
+        ("sumovf", _build_listpack_stream_dump((1 << 63) - 1, 1, 0)),
+        ("sum-deleted-max", _build_listpack_stream_dump(1, (1 << 63) - 1, 0)),
+        ("sum-halves", _build_listpack_stream_dump(1 << 62, 1 << 62, 0)),
+    ])
 
 
 def test_listpack_deleted_mismatch_rejected(dragonfly_port: int):
-    """The master entry declares zero deleted records, but the one record
-    present carries the deleted flag. The counts disagree; reject the value."""
-    payload = _build_listpack_stream_dump(
-        1, 0, 0, record_flags=STREAM_ITEM_FLAG_SAMEFIELDS | STREAM_ITEM_FLAG_DELETED
-    )
-    rejected, restore, exists, alive = _restore_is_rejected(
-        dragonfly_port, "deleted-mismatch", payload
-    )
-    assert alive, (
-        f"server did not survive loading a stream with a deleted-count "
-        f"mismatch: RESTORE reply={restore!r}"
-    )
-    assert rejected, (
-        f"deleted-count-mismatch stream was not safely rejected: "
-        f"RESTORE reply={restore!r} EXISTS={exists!r} server_alive={alive}"
-    )
+    """The declared deleted count disagrees with the deleted flags on the
+    records present. RESTORE has to reply with an error, the key must not
+    exist and the server keeps serving."""
+    same = STREAM_ITEM_FLAG_SAMEFIELDS
+    gone = STREAM_ITEM_FLAG_SAMEFIELDS | STREAM_ITEM_FLAG_DELETED
+    _assert_all_rejected(dragonfly_port, "deleted-count-mismatch", [
+        # declares 0 deleted, the one record is flagged deleted
+        ("deleted-mismatch", _build_listpack_stream_dump(1, 0, 0, record_flags=gone)),
+        # declares 1 deleted, the one record is live
+        ("deleted-missing", _build_listpack_stream_dump(0, 1, 0, record_flags=[same])),
+        # declares 1 deleted, both records are flagged deleted
+        ("deleted-extra", _build_listpack_stream_dump(1, 1, 0, record_flags=[gone, gone])),
+    ])
 
 
 # ── The snapshot-file load path ──────────────────────────────────────────────
 #
-# RESTORE loads a client-supplied value with the deep integrity flag set. A
-# snapshot read at startup, and a stream pushed by a master over replication,
-# load without that flag, yet both are reachable on a no-authentication
-# deployment. This case drives a load through the file path by writing a
-# crafted RDB snapshot to disk and pointing a fresh server at it, so whatever
-# the loader does with the deep flag is irrelevant here. The replication path
-# sets up its own loader and has its own tests below. The payload is the
-# deleted-count-mismatch value because it gives a deterministic, externally
-# observable outcome on this path: the key is either stored or skipped, and the
-# test asserts on that alone. The other crafted values are not used here
-# because their outcome on a startup load is not deterministic enough to assert
-# on. The replication tests use the same value for the same reason.
+# A snapshot read at startup and a stream pushed by a master over replication
+# both reach the server without RESTORE, and both are reachable on a
+# no-authentication deployment. This case writes a crafted RDB snapshot to disk
+# and starts a fresh server on it. Replication has its own tests below.
+#
+# The first case uses the deleted-count-mismatch value because it gives a
+# deterministic, externally observable outcome on this path: the key is either
+# stored or skipped, and the test asserts on that alone. The other crafted
+# RESTORE values are not used here because their outcome on a startup load is
+# not deterministic enough to assert on. The replication tests use the same
+# value for the same reason. The second case is a listpack that ends early
+# inside its declared size, which has the same stored-or-skipped outcome.
 
 
 def _build_rdb_snapshot_file(dump_payload: bytes, key: str) -> bytes:
@@ -595,15 +614,10 @@ def _wait_until_loaded(port: int, key: str, *, timeout_sec: float = 30.0) -> byt
     )
 
 
-def test_nondeep_file_load_path_rejected(tmp_path):
-    """The crafted value is loaded through the snapshot-file path, not RESTORE.
-    The deleted-count-mismatch value must be skipped on this path too, so the
-    key is never created (EXISTS -> 0) and the server comes up serving."""
-    key = "nondeep-dm"
-    dbfilename = "corrupt.rdb"
-    payload = _build_listpack_stream_dump(
-        1, 0, 0, record_flags=STREAM_ITEM_FLAG_SAMEFIELDS | STREAM_ITEM_FLAG_DELETED
-    )
+def _load_snapshot(tmp_path, key: str, payload: bytes) -> tuple[bytes, bool]:
+    """Write ``payload`` under ``key`` into a snapshot file, start a fresh
+    server on it and return (EXISTS reply once loading is over, server alive)."""
+    dbfilename = f"{key}.rdb"
     (tmp_path / dbfilename).write_bytes(_build_rdb_snapshot_file(payload, key))
 
     port = _pick_free_port()
@@ -613,24 +627,53 @@ def test_nondeep_file_load_path_rejected(tmp_path):
         alive = _server_alive(port)
     finally:
         _kill(proc)
+    return exists_reply, alive
+
+
+def test_snapshot_file_load_rejected(tmp_path):
+    """The crafted value is loaded through the snapshot-file path, not RESTORE.
+    The deleted-count-mismatch value must be skipped on this path too, so the
+    key is never created (EXISTS -> 0) and the server comes up serving."""
+    payload = _build_listpack_stream_dump(
+        1, 0, 0, record_flags=STREAM_ITEM_FLAG_SAMEFIELDS | STREAM_ITEM_FLAG_DELETED
+    )
+    exists_reply, alive = _load_snapshot(tmp_path, "snapshot-dm", payload)
 
     assert alive, (
-        "server did not survive loading a crafted stream snapshot through the "
-        "non-deep file-load path (it crashed during load)"
+        "server did not survive loading a crafted stream snapshot at startup "
+        "(it crashed during load)"
     )
     assert exists_reply.startswith(b":0\r\n"), (
         "a crafted stream value was stored through the snapshot-file load path: "
-        f"the deleted-count-mismatch key was created (EXISTS={exists_reply!r}). "
-        "Stream validation has to run on every load path, not only on RESTORE."
+        f"the deleted-count-mismatch key was created (EXISTS={exists_reply!r})"
+    )
+
+
+def test_snapshot_trailing_bytes_rejected(tmp_path):
+    """A one-entry stream whose listpack hits LP_EOF before the end of its
+    declared size, with stray bytes after it, arrives in a snapshot file. Its
+    counts and records are otherwise consistent. The key must not be created
+    and the server comes up serving."""
+    payload = _build_listpack_stream_dump(
+        1, 0, 0, record_flags=STREAM_ITEM_FLAG_SAMEFIELDS, lp_tail=b"\x00\x01"
+    )
+    exists_reply, alive = _load_snapshot(tmp_path, "snapshot-tail", payload)
+
+    assert alive, (
+        "server did not survive loading a stream snapshot with bytes after the "
+        "listpack end (it crashed during load)"
+    )
+    assert exists_reply.startswith(b":0\r\n"), (
+        "a stream whose listpack ends early inside its declared size was stored "
+        f"through the snapshot-file load path (EXISTS={exists_reply!r})"
     )
 
 
 # ── The replication load path ───────────────────────────────────────────────
 #
-# A replica that full-syncs from a Redis-style master reads the snapshot off
-# the socket with a loader of its own, separate from the one used for a file
-# at startup. To reach it, the test runs a stand-in master in-process and
-# sends REPLICAOF to a fresh server. The stand-in answers the handshake and
+# A replica that full-syncs from a Redis-style master loads the snapshot it
+# receives over the socket. To drive that, the test runs a stand-in master
+# in-process and sends REPLICAOF to a fresh server. The stand-in answers the handshake and
 # replies to PSYNC with FULLRESYNC plus a sized snapshot built the same way as
 # in the file-path test.
 #
@@ -806,8 +849,7 @@ def test_replication_full_sync_rejected():
     assert exists_reply.startswith(b":0\r\n"), (
         "a crafted stream value was stored through a replication full sync: "
         f"the deleted-count-mismatch key was created (EXISTS={exists_reply!r}, "
-        f"sync {result}). Stream validation has to run on the replication load "
-        "path too."
+        f"sync {result})"
     )
 
 
@@ -829,7 +871,7 @@ def test_replication_full_sync_wellformed_loads():
     )
 
 
-# ── pass_to_pass: well-formed streams must still load and round-trip ────────
+# ── Well-formed streams load and round-trip ────────────────────────────────
 
 def test_wellformed_consumer_group_roundtrips(dragonfly_port: int):
     """A hand-built stream with a valid single-owner consumer group must still

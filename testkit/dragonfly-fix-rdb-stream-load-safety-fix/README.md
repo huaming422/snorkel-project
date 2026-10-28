@@ -1,33 +1,31 @@
 # Test kit - dragonfly-fix-rdb-stream-load-safety-fix
 
-Runs the eleven-test verifier in the task image against an empty patch and the reference patch, and checks the stale-binary case the reviewer reported.
+Runs the twelve-test verifier in the task image against an empty patch, the reference patch, and the reference patch with its end-of-listpack check turned off.
 
 ## Run
 
 1. Start Docker Desktop.
 2. Open Git Bash in this folder and run `./run_tests.sh`.
-3. The first build clones dragonfly and does a full debug build (a few GB, 30+ min). Later runs reuse the image.
+3. If the `dragonfly-fix-rdb-stream-load-safety:latest` image from the last run is still there it is reused. Otherwise the first build clones dragonfly and does a full debug build (a few GB, 30+ min).
 4. Send back `results.txt` (or paste it).
 
 ## Cases
 
-- `nop`: no patch, revised test-setup.sh, verifier.
-- `oracle`: reference patch, revised test-setup.sh, verifier.
-- `stale_old`: reference patch built, then a compile error added to rdb_load.cc, then the previous test-setup.sh runs again. This is the reviewer's case.
-- `stale_new`: same as `stale_old` but with the revised test-setup.sh, which deletes the binary when the build fails.
+- `nop`: no patch, test-setup.sh, verifier.
+- `oracle`: reference patch, test-setup.sh, verifier.
+- `oracle_no_eof`: reference patch, then its `if (next || p != lp + size - 1)` check is replaced with `if (false)`, then setup and verifier. This is the partial-fix probe for the new trailing-bytes test.
 
 ## Expected results
 
 | Case | Expected |
 |---|---|
-| nop | 4 passed, 7 failed. Passing: the four well-formed tests (`test_wellformed_stream_roundtrips`, `test_wellformed_consumer_group_roundtrips`, `test_wellformed_group_with_deleted_entry_roundtrips`, `test_replication_full_sync_wellformed_loads`) |
-| oracle | 11 passed |
-| stale_old | 11 passed (the old hole: the reference binary is still there) |
-| stale_new | 0 passed, all 11 failed or errored, the setup log shows `build failed, removing the stale binary` and `ls` shows no binary |
+| nop | 4 passed, 8 failed. Passing: `test_wellformed_stream_roundtrips`, `test_wellformed_consumer_group_roundtrips`, `test_wellformed_group_with_deleted_entry_roundtrips`, `test_replication_full_sync_wellformed_loads` |
+| oracle | 12 passed |
+| oracle_no_eof | `EOF_CHECK_DISABLED=1`, then 11 passed and 1 failed, the failing one is `test_snapshot_trailing_bytes_rejected` |
 
-In every case the setup lines must end with `SETUP_RETURNED`. If it is missing, the setup script stopped test.sh, which is a bug.
+In every case the setup lines must end with `SETUP_RETURNED`.
 
-Anything else, especially oracle not passing all 11 or nop not showing 4 of 11, means the verifier or setup needs another look before submit.
+Anything else means the verifier needs another look before submit. The most likely surprise is `nop` passing `test_snapshot_trailing_bytes_rejected` or one of the new RESTORE variants, or `oracle` failing one of them.
 
 ## Clean up afterwards
 
