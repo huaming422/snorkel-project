@@ -1,0 +1,244 @@
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+index d9954b53..8648099e 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+@@ -318,6 +318,17 @@ export default function transformProps(
+       rebaseToPercentChange(forecastRebasedData, xAxisLabel || DTTM_ALIAS)
+     : forecastRebasedData;
+   const isHorizontal = orientation === OrientationType.Horizontal;
++  // Include both raw and verbose labels so exclusion still works after
++  // rebaseForecastDatum renames columns via verboseMap.
++  const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData).flatMap(
++    metric => {
++      const label = getMetricLabel(metric);
++      const verboseLabel = verboseMap[label];
++      return verboseLabel && verboseLabel !== label
++        ? [label, verboseLabel]
++        : [label];
++    },
++  );
+   const { totalStackedValues, thresholdValues } = extractDataTotalValues(
+     rebasedData,
+     {
+@@ -325,11 +336,9 @@ export default function transformProps(
+       percentageThreshold,
+       xAxisCol: xAxisLabel,
+       legendState,
++      extraMetricLabels,
+     },
+   );
+-  const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData).map(
+-    getMetricLabel,
+-  );
+ 
+   const isMultiSeries = groupBy.length || metrics?.length > 1;
+   const xAxisDataType = dataTypes?.[xAxisLabel] ?? dataTypes?.[xAxisOrig];
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+index 88631b48..732d9318 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+@@ -387,6 +387,9 @@ export function extractDataTotalValues(
+     percentageThreshold: number;
+     xAxisCol: string;
+     legendState?: LegendState;
++    // Metrics fetched only for sorting (e.g. x-axis sort by a non-displayed
++    // metric) must not contribute to stacked totals or the bar total label.
++    extraMetricLabels?: string[];
+   },
+ ): {
+   totalStackedValues: number[];
+@@ -394,11 +397,18 @@ export function extractDataTotalValues(
+ } {
+   const totalStackedValues: number[] = [];
+   const thresholdValues: number[] = [];
+-  const { stack, percentageThreshold, xAxisCol, legendState } = opts;
++  const {
++    stack,
++    percentageThreshold,
++    xAxisCol,
++    legendState,
++    extraMetricLabels = [],
++  } = opts;
++  const excludedKeys = new Set(extraMetricLabels);
+   if (stack) {
+     data.forEach(datum => {
+       const values = Object.keys(datum).reduce((prev, curr) => {
+-        if (curr === xAxisCol) {
++        if (curr === xAxisCol || excludedKeys.has(curr)) {
+           return prev;
+         }
+         if (legendState && !legendState[curr]) {
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts b/superset-frontend/plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts
+index b4d82b8b..a0db8b1d 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts
+@@ -828,6 +828,76 @@ describe('Does transformProps transform series correctly', () => {
+       'foo2, bar2': ['foo2', 'bar2'],
+     });
+   });
++
++  test('stacked totals exclude sort-only extra metrics not displayed as bars', () => {
++    // When x-axis is sorted by a metric that is not one of the displayed metrics,
++    // that sort metric is fetched as an "extra" column. Bar totals must still
++    // equal the sum of the stacked segments that are actually rendered.
++    const sortOnlyFormData: SqlaFormData = {
++      viz_type: 'echarts_timeseries_bar',
++      colorScheme: 'bnbColors',
++      datasource: '3__table',
++      granularity_sqla: 'ds',
++      metrics: ['sales', 'profit'],
++      groupby: [],
++      x_axis: 'category',
++      x_axis_sort: 'sort_metric',
++      timeseries_limit_metric: 'sort_metric',
++      showValue: true,
++      stack: true,
++      onlyTotal: true,
++      percentageThreshold: 0,
++      seriesType: EchartsTimeseriesSeriesType.Bar,
++    };
++
++    const sortOnlyQueriesData: ChartDataResponseResult[] = [
++      createTestQueryData([
++        { category: 'A', sales: 10, profit: 5, sort_metric: 100 },
++        { category: 'B', sales: 20, profit: 8, sort_metric: 50 },
++        { category: 'C', sales: 3, profit: 1, sort_metric: 7 },
++      ]),
++    ];
++
++    const chartProps = createTestChartProps({
++      formData: sortOnlyFormData,
++      queriesData: sortOnlyQueriesData,
++    });
++
++    const transformedSeries = transformProps(chartProps).echartOptions
++      .series as seriesType[];
++
++    // Only sales and profit should be rendered — not sort_metric.
++    const seriesNames = transformedSeries.map(s => s.name).sort();
++    expect(seriesNames).toEqual(['profit', 'sales']);
++
++    // Expected totals = sales + profit per category (excluding sort_metric)
++    const expectedTotals = [15, 28, 4];
++
++    const showValueIndexes: number[] = [];
++    transformedSeries.forEach((entry, seriesIndex) => {
++      const { data = [] } = entry;
++      (data as [Date, number][]).forEach((datum, dataIndex) => {
++        if (datum[1] !== null) {
++          showValueIndexes[dataIndex] = seriesIndex;
++        }
++      });
++    });
++
++    transformedSeries.forEach((series, seriesIndex) => {
++      series.data.forEach((value, dataIndex) => {
++        const params = {
++          value,
++          dataIndex,
++          seriesIndex,
++        };
++        const expectedLabel =
++          seriesIndex === showValueIndexes[dataIndex]
++            ? String(expectedTotals[dataIndex])
++            : '';
++        expect(series.label.formatter(params)).toBe(expectedLabel);
++      });
++    });
++  });
+ });
+ 
+ describe('legend sorting', () => {
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts b/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
+index 13f36ddd..c10adc85 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
+@@ -28,6 +28,7 @@ import { GenericDataType } from '@apache-superset/core/common';
+ import {
+   calculateLowerLogTick,
+   dedupSeries,
++  extractDataTotalValues,
+   extractGroupbyLabel,
+   extractSeries,
+   extractShowValueIndexes,
+@@ -50,7 +51,7 @@ import {
+   LegendType,
+ } from '../../src/types';
+ import { defaultLegendPadding } from '../../src/defaults';
+-import { NULL_STRING } from '../../src/constants';
++import { NULL_STRING, StackControlsValue } from '../../src/constants';
+ 
+ const {
+   getHorizontalLegendAvailableWidth,
+@@ -467,6 +468,71 @@ test('sortAndFilterSeries by name with numbers desc', () => {
+   ]);
+ });
+ 
++describe('extractDataTotalValues', () => {
++  const data: DataRecord[] = [
++    { my_x_axis: 'a', sales: 10, profit: 5, sort_only: 100 },
++    { my_x_axis: 'b', sales: 20, profit: 8, sort_only: 50 },
++    { my_x_axis: 'c', sales: 3, profit: 1, sort_only: 7 },
++  ];
++
++  test('sums all non-x-axis values when stacked', () => {
++    expect(
++      extractDataTotalValues(data, {
++        stack: StackControlsValue.Stack,
++        percentageThreshold: 0,
++        xAxisCol: 'my_x_axis',
++      }),
++    ).toEqual({
++      totalStackedValues: [115, 78, 11],
++      thresholdValues: [0, 0, 0],
++    });
++  });
++
++  test('excludes extra sort-only metrics from stacked totals', () => {
++    expect(
++      extractDataTotalValues(data, {
++        stack: StackControlsValue.Stack,
++        percentageThreshold: 0,
++        xAxisCol: 'my_x_axis',
++        extraMetricLabels: ['sort_only'],
++      }),
++    ).toEqual({
++      totalStackedValues: [15, 28, 4],
++      thresholdValues: [0, 0, 0],
++    });
++  });
++
++  test('respects legendState and extra metrics together', () => {
++    expect(
++      extractDataTotalValues(data, {
++        stack: StackControlsValue.Stack,
++        percentageThreshold: 50,
++        xAxisCol: 'my_x_axis',
++        legendState: { sales: true, profit: false, sort_only: true },
++        extraMetricLabels: ['sort_only'],
++      }),
++    ).toEqual({
++      // only sales contributes: 10, 20, 3
++      totalStackedValues: [10, 20, 3],
++      thresholdValues: [5, 10, 1.5],
++    });
++  });
++
++  test('returns empty totals when not stacked', () => {
++    expect(
++      extractDataTotalValues(data, {
++        stack: false,
++        percentageThreshold: 0,
++        xAxisCol: 'my_x_axis',
++        extraMetricLabels: ['sort_only'],
++      }),
++    ).toEqual({
++      totalStackedValues: [],
++      thresholdValues: [],
++    });
++  });
++});
++
+ describe('extractSeries', () => {
+   test('should generate a valid ECharts timeseries series object', () => {
+     const data = [

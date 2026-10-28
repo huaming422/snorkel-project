@@ -1,0 +1,65 @@
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+index d9954b537a1..a774ec0f24b 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+@@ -318,6 +318,14 @@ export default function transformProps(
+       rebaseToPercentChange(forecastRebasedData, xAxisLabel || DTTM_ALIAS)
+     : forecastRebasedData;
+   const isHorizontal = orientation === OrientationType.Horizontal;
++  // rebasedData's keys have already been through rebaseForecastDatum, which
++  // renames a key to its verboseMap entry when one is configured for that
++  // metric. extraMetricLabels must be mapped the same way, or a sort-only
++  // metric with a verbose_name set would silently fail to match here (and in
++  // extractSeries below, which has the same requirement).
++  const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData)
++    .map(getMetricLabel)
++    .map(label => verboseMap[label] ?? label);
+   const { totalStackedValues, thresholdValues } = extractDataTotalValues(
+     rebasedData,
+     {
+@@ -325,11 +333,9 @@ export default function transformProps(
+       percentageThreshold,
+       xAxisCol: xAxisLabel,
+       legendState,
++      extraMetricLabels,
+     },
+   );
+-  const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData).map(
+-    getMetricLabel,
+-  );
+
+   const isMultiSeries = groupBy.length || metrics?.length > 1;
+   const xAxisDataType = dataTypes?.[xAxisLabel] ?? dataTypes?.[xAxisOrig];
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+index 88631b48686..639d91c934c 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+@@ -387,6 +387,7 @@ export function extractDataTotalValues(
+     percentageThreshold: number;
+     xAxisCol: string;
+     legendState?: LegendState;
++    extraMetricLabels?: string[];
+   },
+ ): {
+   totalStackedValues: number[];
+@@ -394,11 +395,18 @@ export function extractDataTotalValues(
+ } {
+   const totalStackedValues: number[] = [];
+   const thresholdValues: number[] = [];
+-  const { stack, percentageThreshold, xAxisCol, legendState } = opts;
++  const {
++    stack,
++    percentageThreshold,
++    xAxisCol,
++    legendState,
++    extraMetricLabels,
++  } = opts;
++  const excludedKeys = new Set([xAxisCol, ...(extraMetricLabels ?? [])]);
+   if (stack) {
+     data.forEach(datum => {
+       const values = Object.keys(datum).reduce((prev, curr) => {
+-        if (curr === xAxisCol) {
++        if (excludedKeys.has(curr)) {
+           return prev;
+         }
+         if (legendState && !legendState[curr]) {

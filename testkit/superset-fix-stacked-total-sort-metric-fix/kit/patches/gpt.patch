@@ -1,0 +1,182 @@
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+index d9954b53..eadf957b 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+@@ -318,18 +318,19 @@ export default function transformProps(
+       rebaseToPercentChange(forecastRebasedData, xAxisLabel || DTTM_ALIAS)
+     : forecastRebasedData;
+   const isHorizontal = orientation === OrientationType.Horizontal;
++  const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData).map(
++    getMetricLabel,
++  );
+   const { totalStackedValues, thresholdValues } = extractDataTotalValues(
+     rebasedData,
+     {
+       stack,
+       percentageThreshold,
+       xAxisCol: xAxisLabel,
++      extraMetricLabels,
+       legendState,
+     },
+   );
+-  const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData).map(
+-    getMetricLabel,
+-  );
+ 
+   const isMultiSeries = groupBy.length || metrics?.length > 1;
+   const xAxisDataType = dataTypes?.[xAxisLabel] ?? dataTypes?.[xAxisOrig];
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+index 88631b48..aa221386 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+@@ -386,6 +386,7 @@ export function extractDataTotalValues(
+     stack: StackType;
+     percentageThreshold: number;
+     xAxisCol: string;
++    extraMetricLabels?: string[];
+     legendState?: LegendState;
+   },
+ ): {
+@@ -394,18 +395,18 @@ export function extractDataTotalValues(
+ } {
+   const totalStackedValues: number[] = [];
+   const thresholdValues: number[] = [];
+-  const { stack, percentageThreshold, xAxisCol, legendState } = opts;
++  const { stack, percentageThreshold, xAxisCol, extraMetricLabels = [], legendState } = opts;
+   if (stack) {
+     data.forEach(datum => {
+       const values = Object.keys(datum).reduce((prev, curr) => {
+-        if (curr === xAxisCol) {
++        if (curr === xAxisCol || extraMetricLabels.includes(curr)) {
+           return prev;
+         }
+         if (legendState && !legendState[curr]) {
+           return prev;
+         }
+-        const value = datum[curr] || 0;
+-        return prev + (value as number);
++        const value = datum[curr];
++        return prev + (typeof value === 'number' ? value : 0);
+       }, 0);
+       totalStackedValues.push(values);
+       thresholdValues.push(((percentageThreshold || 0) / 100) * values);
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts b/superset-frontend/plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts
+index b4d82b8b..3f823610 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts
+@@ -755,6 +755,67 @@ describe('Does transformProps transform series correctly', () => {
+     });
+   });
+ 
++  test('should show stacked totals from displayed metrics when x-axis sort uses a hidden extra metric', () => {
++    const rows = createTestData(
++      [
++        { metric_a: 1, metric_b: 2, metric_c: 100 },
++        { metric_a: 3, metric_b: 4, metric_c: 200 },
++        { metric_a: 5, metric_b: 6, metric_c: 300 },
++      ],
++      { intervalMs: 300000000 },
++    );
++
++    const chartProps = createTestChartProps({
++      formData: {
++        ...formData,
++        metrics: ['metric_a', 'metric_b'],
++        groupby: [],
++        onlyTotal: true,
++        percentageThreshold: 0,
++        xAxisSort: 'metric_c',
++        xAxisSortAsc: false,
++        x_axis_sort: 'metric_c',
++        x_axis_sort_asc: false,
++        timeseries_limit_metric: 'metric_c',
++      } as Partial<EchartsTimeseriesFormData>,
++      queriesData: [createTestQueryData(rows)],
++    });
++
++    const transformedSeries = transformProps(chartProps).echartOptions
++      .series as seriesType[];
++
++    const showValueIndexes: number[] = [];
++
++    transformedSeries.forEach((entry, seriesIndex) => {
++      const { data = [] } = entry;
++      (data as [Date, number][]).forEach((datum, dataIndex) => {
++        if (datum[1] !== null) {
++          showValueIndexes[dataIndex] = seriesIndex;
++        }
++      });
++    });
++
++    const expectedTotals = rows.map(row => row.metric_a + row.metric_b);
++
++    transformedSeries.forEach((series, seriesIndex) => {
++      series.data.forEach((value, dataIndex) => {
++        const params = {
++          value,
++          dataIndex,
++          seriesIndex,
++          seriesName: series.name,
++        };
++
++        const expectedLabel =
++          seriesIndex === showValueIndexes[dataIndex]
++            ? String(expectedTotals[dataIndex])
++            : '';
++
++        expect(series.label.formatter(params)).toBe(expectedLabel);
++      });
++    });
++  });
++
+   test('should show labels on values >= percentageThreshold if onlyTotal is false', () => {
+     const chartProps = createTestChartProps({ formData, queriesData });
+ 
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts b/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
+index 13f36ddd..48659d50 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
+@@ -28,6 +28,7 @@ import { GenericDataType } from '@apache-superset/core/common';
+ import {
+   calculateLowerLogTick,
+   dedupSeries,
++  extractDataTotalValues,
+   extractGroupbyLabel,
+   extractSeries,
+   extractShowValueIndexes,
+@@ -467,6 +468,26 @@ test('sortAndFilterSeries by name with numbers desc', () => {
+   ]);
+ });
+ 
++test('extractDataTotalValues excludes hidden extra metrics from stacked totals', () => {
++  expect(
++    extractDataTotalValues(
++      [
++        { __timestamp: '2024-01-01', metric_a: 1, metric_b: 2, metric_c: 100 },
++        { __timestamp: '2024-01-02', metric_a: 3, metric_b: 4, metric_c: 200 },
++      ],
++      {
++        stack: true,
++        percentageThreshold: 50,
++        xAxisCol: '__timestamp',
++        extraMetricLabels: ['metric_c'],
++      },
++    ),
++  ).toEqual({
++    totalStackedValues: [3, 7],
++    thresholdValues: [1.5, 3.5],
++  });
++});
++
+ describe('extractSeries', () => {
+   test('should generate a valid ECharts timeseries series object', () => {
+     const data = [
+diff --git a/superset-frontend/scripts/reproduce-stacked-total-hidden-sort-metric.sh b/superset-frontend/scripts/reproduce-stacked-total-hidden-sort-metric.sh
+new file mode 100755
+index 00000000..84a63696
+--- /dev/null
++++ b/superset-frontend/scripts/reproduce-stacked-total-hidden-sort-metric.sh
+@@ -0,0 +1,3 @@
++#!/usr/bin/env bash
++set -euo pipefail
++npx jest --runInBand plugins/plugin-chart-echarts/test/Timeseries/transformProps.test.ts -t "should show stacked totals from displayed metrics when x-axis sort uses a hidden extra metric"

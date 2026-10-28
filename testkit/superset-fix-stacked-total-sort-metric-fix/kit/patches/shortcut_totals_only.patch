@@ -1,0 +1,38 @@
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+@@ -325,6 +325,9 @@ export default function transformProps(
+       percentageThreshold,
+       xAxisCol: xAxisLabel,
+       legendState,
++      extraMetricLabels: extractExtraMetrics(chartProps.rawFormData)
++        .map(getMetricLabel)
++        .map(label => verboseMap[label] ?? label),
+     },
+   );
+   const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData).map(
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+@@ -387,6 +387,7 @@ export function extractDataTotalValues(
+     percentageThreshold: number;
+     xAxisCol: string;
+     legendState?: LegendState;
++    extraMetricLabels?: string[];
+   },
+ ): {
+   totalStackedValues: number[];
+@@ -394,11 +395,11 @@ export function extractDataTotalValues(
+ } {
+   const totalStackedValues: number[] = [];
+   const thresholdValues: number[] = [];
+-  const { stack, percentageThreshold, xAxisCol, legendState } = opts;
++  const { stack, percentageThreshold, xAxisCol, legendState, extraMetricLabels = [] } = opts;
+   if (stack) {
+     data.forEach(datum => {
+       const values = Object.keys(datum).reduce((prev, curr) => {
+-        if (curr === xAxisCol) {
++        if (curr === xAxisCol || extraMetricLabels.includes(curr)) {
+           return prev;
+         }
+         if (legendState && !legendState[curr]) {

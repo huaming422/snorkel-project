@@ -1,0 +1,137 @@
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+index d9954b53..8cd97a0b 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/Timeseries/transformProps.ts
+@@ -318,6 +318,9 @@ export default function transformProps(
+       rebaseToPercentChange(forecastRebasedData, xAxisLabel || DTTM_ALIAS)
+     : forecastRebasedData;
+   const isHorizontal = orientation === OrientationType.Horizontal;
++  const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData).map(
++    getMetricLabel,
++  );
+   const { totalStackedValues, thresholdValues } = extractDataTotalValues(
+     rebasedData,
+     {
+@@ -325,11 +328,9 @@ export default function transformProps(
+       percentageThreshold,
+       xAxisCol: xAxisLabel,
+       legendState,
++      extraMetricLabels,
+     },
+   );
+-  const extraMetricLabels = extractExtraMetrics(chartProps.rawFormData).map(
+-    getMetricLabel,
+-  );
+ 
+   const isMultiSeries = groupBy.length || metrics?.length > 1;
+   const xAxisDataType = dataTypes?.[xAxisLabel] ?? dataTypes?.[xAxisOrig];
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+index 88631b48..e45a380e 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/src/utils/series.ts
+@@ -387,6 +387,7 @@ export function extractDataTotalValues(
+     percentageThreshold: number;
+     xAxisCol: string;
+     legendState?: LegendState;
++    extraMetricLabels?: string[];
+   },
+ ): {
+   totalStackedValues: number[];
+@@ -394,13 +395,26 @@ export function extractDataTotalValues(
+ } {
+   const totalStackedValues: number[] = [];
+   const thresholdValues: number[] = [];
+-  const { stack, percentageThreshold, xAxisCol, legendState } = opts;
++  const {
++    stack,
++    percentageThreshold,
++    xAxisCol,
++    legendState,
++    extraMetricLabels = [],
++  } = opts;
+   if (stack) {
+     data.forEach(datum => {
+       const values = Object.keys(datum).reduce((prev, curr) => {
+         if (curr === xAxisCol) {
+           return prev;
+         }
++        // Exclude columns that are not stacked as bars/segments (e.g. a
++        // metric used only to sort the x-axis). Otherwise the total shown on
++        // top of each bar would be larger than the sum of the visible
++        // segments.
++        if (extraMetricLabels.includes(curr)) {
++          return prev;
++        }
+         if (legendState && !legendState[curr]) {
+           return prev;
+         }
+diff --git a/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts b/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
+index 13f36ddd..e6a6b0ef 100644
+--- a/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
++++ b/superset-frontend/plugins/plugin-chart-echarts/test/utils/series.test.ts
+@@ -28,6 +28,7 @@ import { GenericDataType } from '@apache-superset/core/common';
+ import {
+   calculateLowerLogTick,
+   dedupSeries,
++  extractDataTotalValues,
+   extractGroupbyLabel,
+   extractSeries,
+   extractShowValueIndexes,
+@@ -1749,3 +1750,57 @@ test('getAreaScaledSymbolSize handles degenerate extents and bad values', () =>
+     midAreaSize,
+   );
+ });
++
++describe('extractDataTotalValues', () => {
++  const data = [
++    { __timestamp: '2000-01-01', Hulk: 2, abc: 3, sortMetric: 100 },
++    { __timestamp: '2000-02-01', Hulk: 2, abc: 10, sortMetric: 200 },
++    { __timestamp: '2000-03-01', Hulk: 1, abc: 5, sortMetric: 300 },
++  ];
++
++  test('sums all non-xAxis columns when no extra metrics are provided', () => {
++    // NOTE: without excluding the extra sort metric the totals are inflated.
++    const { totalStackedValues } = extractDataTotalValues(data, {
++      stack: true,
++      percentageThreshold: 0,
++      xAxisCol: '__timestamp',
++    });
++    expect(totalStackedValues).toEqual([105, 212, 306]);
++  });
++
++  test('excludes extra metric labels (e.g. an x-axis sort metric not shown as a bar)', () => {
++    const { totalStackedValues } = extractDataTotalValues(data, {
++      stack: true,
++      percentageThreshold: 0,
++      xAxisCol: '__timestamp',
++      extraMetricLabels: ['sortMetric'],
++    });
++    // Totals should match the sum of the stacked segments only.
++    expect(totalStackedValues).toEqual([5, 12, 6]);
++  });
++
++  test('respects legendState together with extraMetricLabels', () => {
++    const { totalStackedValues } = extractDataTotalValues(data, {
++      stack: true,
++      percentageThreshold: 0,
++      xAxisCol: '__timestamp',
++      extraMetricLabels: ['sortMetric'],
++      legendState: { Hulk: true, abc: false },
++    });
++    expect(totalStackedValues).toEqual([2, 2, 1]);
++  });
++
++  test('returns empty arrays when not stacked', () => {
++    const { totalStackedValues, thresholdValues } = extractDataTotalValues(
++      data,
++      {
++        stack: false,
++        percentageThreshold: 0,
++        xAxisCol: '__timestamp',
++        extraMetricLabels: ['sortMetric'],
++      },
++    );
++    expect(totalStackedValues).toEqual([]);
++    expect(thresholdValues).toEqual([]);
++  });
++});
