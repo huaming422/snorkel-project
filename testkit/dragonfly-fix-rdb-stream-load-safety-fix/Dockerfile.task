@@ -1,0 +1,136 @@
+FROM ubuntu:24.04
+# Pipes inside RUN fail loudly: without pipefail a failing `curl` before `| sh`
+# is invisible and the image "builds" without the tool.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Test runners size worker pools from the visible CPU count, so peak memory
+# scales with the host, not with the task's declared resources. Cap the runner
+# pools to the task.toml cpus (4 here) so the declared memory bound holds on any
+# host. The dragonfly verifier is pure-stdlib Python driving the server over a
+# socket (no pytest-xdist / turbo / vitest / cargo / go test), so those knobs
+# are inapplicable here; only the C/C++ build parallelism knob is meaningful and
+# is sized to cpus. MAKEFLAGS is never set (nested makes inherit it and break);
+# test-setup.sh sizes the ninja job count itself.
+ENV CMAKE_BUILD_PARALLEL_LEVEL=4 \
+    GOMAXPROCS=4
+# caps-skip: TURBO_CONCURRENCY - no turborepo in this task
+# caps-skip: VITEST_MAX_THREADS - no vitest in this task
+# caps-skip: VITEST_MIN_THREADS - no vitest in this task
+# caps-skip: CARGO_BUILD_JOBS - no cargo in this task
+# caps-skip: RUST_TEST_THREADS - no rust in this task
+# caps-skip: PYTEST_XDIST_AUTO_NUM_WORKERS - verifier runs single-process pytest
+
+# System packages to build Dragonfly (C++20) via its CMake/helio toolchain.
+#  * build-essential, cmake, ninja-build, bison, flex, autoconf-archive, libtool,
+#    automake, autoconf: dragonfly's CMake/helio build
+#  * gcc-13 / g++-13: the pre-fix tree (base commit 2026-07-24) compiles
+#    src/core/search/vector_utils.cc, which uses the `_Float16` AND `__bf16`
+#    scalar types. On x86-64, `_Float16` needs GCC 12+ and `__bf16` needs
+#    GCC 13+; ubuntu:22.04's GCC 11 and even gcc-12 reject `__bf16`
+#    ("`__bf16` was not declared in this scope"). Dragonfly's own CI builds this
+#    tree on ubuntu-dev:24 (Ubuntu 24.04 / GCC 13), so this image uses the
+#    ubuntu:24.04 base and selects gcc-13/g++-13 - matching upstream's supported
+#    toolchain. The canonical /opt/tooling venv installs its own uv + Python 3.12
+#    and is unaffected by the base-image bump.
+#  * libboost-context-dev, libssl-dev, libunwind-dev, zlib1g-dev, libzstd-dev,
+#    libpcre2-dev, libfl-dev, pkg-config: link-time deps of dragonfly + helio
+#  * ccache: fast incremental rebuilds after the agent edits a few .cc files
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl wget xz-utils \
+        build-essential gcc-13 g++-13 pkg-config cmake ninja-build \
+        autoconf automake autoconf-archive libtool flex bison \
+        libboost-context-dev libssl-dev libunwind-dev libfl-dev \
+        libpcre2-dev libzstd-dev zlib1g-dev \
+        netcat-openbsd net-tools \
+        ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+# Canonical verifier runtime. Insert after apt/system packages and before the
+# repository language toolchain so same-repo images share the layer. The pins
+# are src/resources/verifier-requirements.txt inlined. BUILD_DATE freezes their
+# transitive resolution (UV_EXCLUDE_NEWER, this install only).
+ARG BUILD_DATE=2026-09-24
+RUN curl -LsSf https://astral.sh/uv/0.11.26/install.sh | env UV_INSTALL_DIR=/opt/tooling/uv UV_NO_MODIFY_PATH=1 sh \
+ && export UV_PYTHON_INSTALL_DIR=/opt/tooling/python UV_NO_CACHE=1 \
+ && /opt/tooling/uv/uv python install 3.12 \
+ && /opt/tooling/uv/uv venv --managed-python --python 3.12 /opt/tooling/venv \
+ && UV_EXCLUDE_NEWER=${BUILD_DATE} /opt/tooling/uv/uv pip install --python /opt/tooling/venv/bin/python \
+    pytest==9.1.1 requests==2.34.2 jinja2==3.1.6 litellm==1.93.0 pydantic==2.13.4 \
+    unidiff==0.7.5 pygments==2.20.0 ast-grep-py==0.44.1 mini-swe-agent==2.4.5 portkey-ai==2.3.3 \
+ && LITELLM_LOCAL_MODEL_COST_MAP=True /opt/tooling/venv/bin/python -c "import ast_grep_py, jinja2, litellm, minisweagent, portkey_ai, pydantic, pygments, pytest, requests, unidiff"
+
+# Make ccache the default compiler wrapper so post-edit rebuilds reuse the
+# cache for unchanged translation units and finish in well under a minute.
+ENV PATH="/usr/lib/ccache:${PATH}" \
+    CCACHE_DIR=/var/cache/ccache \
+    CCACHE_MAXSIZE=4G
+
+# Clone → fetch the pinned commit → rewind → scrub → build the dependency
+# closure → baseline-commit in ONE layer. Every step rewrites the repo's .git
+# object store and/or working tree; splitting them ships each rewrite as its own
+# multi-GB layer. Dragonfly needs the helio submodule to build.
+RUN git clone --depth=1 --single-branch --no-tags --recurse-submodules \
+        --shallow-submodules -b main \
+        https://github.com/dragonflydb/dragonfly.git /repo/dragonfly && \
+    cd /repo/dragonfly && \
+    # Fetch the pre-fix commit explicitly and loudly; 1000 commits of ancestry
+    # keep git log/blame usable for investigating agents.
+    git fetch --depth=1000 origin dfe53a78555dc5b997c26c19062ea09ebdd6a3e5 && \
+    git reset --hard dfe53a78555dc5b997c26c19062ea09ebdd6a3e5 && \
+    # Materialize the helio submodule revision matching the pre-fix commit.
+    git submodule deinit -f helio && \
+    git submodule update --init --recursive helio && \
+    # Fix-leakage prevention: after the reset the post-fix commits are
+    # unreachable from refs but may still be retained by reflog, FETCH_HEAD,
+    # ORIG_HEAD, and the object database. Remove all routes.
+    git remote remove origin && rm -rf .git/refs/remotes && \
+    rm -f .git/FETCH_HEAD .git/ORIG_HEAD && \
+    git reflog expire --expire=now --all && \
+    git gc --prune=now && \
+    # helio is an upstream submodule and carries none of the fix, but scrub its
+    # remote defensively so the agent cannot fetch from it either. Its real git
+    # dir is .git/modules/helio (helio/.git is a gitfile pointer).
+    git -C helio remote remove origin && \
+    rm -f .git/modules/helio/FETCH_HEAD .git/modules/helio/ORIG_HEAD && \
+    git -C helio reflog expire --expire=now --all && \
+    git -C helio gc --prune=now && \
+    # Configure CMake with a minimal feature set - debug build, no AWS/GCP
+    # (saves ~5 min compiling boto/google-cloud-cpp), no gperf. The stream RDB
+    # load path lives in src/server/rdb_load.cc; none of the disabled features
+    # are involved. Output goes to build-dbg/ to match helio/blaze.sh.
+    cmake -B build-dbg -S . -GNinja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -DWITH_AWS=OFF \
+        -DWITH_GCP=OFF \
+        -DWITH_GPERF=OFF \
+        -DWITH_UNWIND=OFF \
+        -DCMAKE_C_COMPILER=gcc-13 \
+        -DCMAKE_CXX_COMPILER=g++-13 \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        > /tmp/cmake.log 2>&1 || { tail -80 /tmp/cmake.log; exit 1; } && \
+    # Build the dragonfly binary at image-time so the agent's incremental
+    # rebuild after editing a few .cc files stays under a minute. Build the
+    # rdb_test unit-test binary too: it is the repo-native regression harness
+    # for the stream RDB loader and compiling it now warms ccache for the
+    # agent's own edit/rebuild loop.
+    ( cd build-dbg && ninja dragonfly rdb_test > /tmp/build.log 2>&1 \
+        || { tail -120 /tmp/build.log; exit 1; } ) && \
+    ls -la build-dbg/dragonfly && ./build-dbg/dragonfly --version && \
+    # Base checkpoint for diff tracking. Snapshot any build-time working-tree
+    # changes under a devcontainer identity so the verifier's agent diff
+    # (base..HEAD) is only the agent's edits; skip the commit when clean.
+    git add -A && \
+    if ! git diff --cached --quiet; then \
+        git -c user.email=automation@localhost -c user.name=devcontainer \
+            commit -m 'chore: initialize dev environment' --no-gpg-sign; \
+    fi && \
+    git rev-parse HEAD > /var/lib/devcontainer_base_ref
+WORKDIR /repo/dragonfly
+
+# Symlink the built binary onto PATH for quick investigation without
+# remembering the build dir.
+ENV DRAGONFLY_PATH=/repo/dragonfly/build-dbg/dragonfly
+RUN ln -sf "$DRAGONFLY_PATH" /usr/local/bin/dragonfly
