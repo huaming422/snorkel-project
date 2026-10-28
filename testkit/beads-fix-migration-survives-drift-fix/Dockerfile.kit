@@ -1,0 +1,5 @@
+FROM beads-fix-migration-survives-drift:latest
+USER root
+COPY kit /kit
+RUN mkdir -p /tests /logs/verifier && chown -R tester:tester /tests /logs /kit
+USER tester

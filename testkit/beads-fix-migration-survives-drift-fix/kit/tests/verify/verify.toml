@@ -1,0 +1,16 @@
+# Reward runner config for beads-fix-migration-survives-drift.
+#
+# The Go runner injects verify_drift_test.go into the named package directory and
+# runs `go test` filtered to the TestVerify* functions below. The whole package
+# test binary still compiles (so a change that removes a helper the suite relies
+# on is caught), but only these functions execute under the -run filter.
+#
+# TestVerifyPackageSuiteGreen itself shells `go test` over the package with the
+# TestVerify* functions skipped, exercising the package's own suite as the
+# build/suite-green gate.
+
+[go]
+package = "internal/storage/schema"
+run = "TestVerifyDriftSurvivesMigration|TestVerifyNonDriftAborts|TestVerifyDriftToleranceBreadth|TestVerifyDriftSkipResumes|TestVerifyDriftResumeOnlySkippedTables|TestVerifyPackageSuiteGreen"
+timeout = 240
+env = { CGO_ENABLED = "1", GOTOOLCHAIN = "local", GOFLAGS = "-mod=mod" }

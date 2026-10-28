@@ -1,0 +1,337 @@
+diff --git a/internal/storage/schema/aux_row_encoding_drift_test.go b/internal/storage/schema/aux_row_encoding_drift_test.go
+new file mode 100644
+index 00000000..09e9089d
+--- /dev/null
++++ b/internal/storage/schema/aux_row_encoding_drift_test.go
+@@ -0,0 +1,198 @@
++package schema
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"testing"
++
++	"github.com/DATA-DOG/go-sqlmock"
++)
++
++// panicOnQueryDBConn forwards every call to an embedded DBConn except that,
++// when the next query/exec whose text contains trigger runs, it panics with
++// the dolt#11131 drift message instead of touching the database. It
++// reproduces the storage-engine panic that the re-key must survive: a read or
++// write against a table whose on-disk encoding has drifted beyond what the
++// engine can decode.
++type panicOnQueryDBConn struct {
++	inner      DBConn
++	trigger    string
++	panicQuery bool // panic on QueryContext (the SELECT) when true
++	panicExec  bool // panic on ExecContext (the UPDATE) when true
++}
++
++const driftPanicMsg = "runtime error: invalid hash length"
++
++func (d panicOnQueryDBConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
++	if d.panicExec && containsSubstr(query, d.trigger) {
++		panic(driftPanicMsg)
++	}
++	return d.inner.ExecContext(ctx, query, args...)
++}
++
++func (d panicOnQueryDBConn) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
++	if d.panicQuery && containsSubstr(query, d.trigger) {
++		panic(driftPanicMsg)
++	}
++	return d.inner.QueryContext(ctx, query, args...)
++}
++
++func (d panicOnQueryDBConn) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
++	return d.inner.QueryRowContext(ctx, query, args...)
++}
++
++func containsSubstr(s, sub string) bool {
++	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
++}
++
++func indexOf(s, sub string) int {
++	for i := 0; i+len(sub) <= len(s); i++ {
++		if s[i:i+len(sub)] == sub {
++			return i
++		}
++	}
++	return -1
++}
++
++// TestRekeyAuxRowTableRecoversSelectDrift reproduces #4380: reading a drifted
++// table panics deep in the storage engine with "invalid hash length". The
++// re-key must recover that panic and report errAuxRowEncodingDrift so the
++// caller can skip the table instead of letting the panic abort the migration
++// (and the database open).
++func TestRekeyAuxRowTableRecoversSelectDrift(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	expectColumnExists(mock, true)
++
++	conn := panicOnQueryDBConn{inner: db, trigger: "FROM comments", panicQuery: true}
++
++	wrote, err := rekeyAuxRowTable(context.Background(), conn, commentsTable)
++	if !errors.Is(err, errAuxRowEncodingDrift) {
++		t.Fatalf("expected errAuxRowEncodingDrift, got wrote=%v err=%v", wrote, err)
++	}
++	if wrote {
++		t.Fatalf("drifted table must report no writes, got wrote=%v", wrote)
++	}
++}
++
++// TestRekeyAuxRowTableRecoversUpdateDrift covers the write side: the SELECT
++// succeeds but the UPDATE panics with the drift message. The same recovery
++// must apply.
++func TestRekeyAuxRowTableRecoversUpdateDrift(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	expectColumnExists(mock, true)
++	expectCommentsSelect(mock).
++		WillReturnRows(sqlmock.NewRows([]string{"id", "issue_id", "author", "text", "created_at"}).
++			AddRow("random-a", "bd-1", "steve", "first", "2026-06-09 12:00:00"))
++
++	conn := panicOnQueryDBConn{inner: db, trigger: "UPDATE comments", panicExec: true}
++
++	wrote, err := rekeyAuxRowTable(context.Background(), conn, commentsTable)
++	if !errors.Is(err, errAuxRowEncodingDrift) {
++		t.Fatalf("expected errAuxRowEncodingDrift, got wrote=%v err=%v", wrote, err)
++	}
++}
++
++// TestRekeyAuxRowTableRepanicsUnknownPanic guards the recover's scope: a panic
++// that is NOT the drift we know how to survive must propagate, not be silently
++// swallowed.
++func TestRekeyAuxRowTableRepanicsUnknownPanic(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	expectColumnExists(mock, true)
++
++	conn := panicOnQueryDBConnCustom{inner: db, trigger: "FROM comments", msg: "some other fatal bug"}
++
++	defer func() {
++		r := recover()
++		if r == nil {
++			t.Fatalf("expected the non-drift panic to propagate, but it was swallowed")
++		}
++	}()
++	_, _ = rekeyAuxRowTable(context.Background(), conn, commentsTable)
++}
++
++type panicOnQueryDBConnCustom struct {
++	inner   DBConn
++	trigger string
++	msg     string
++}
++
++func (d panicOnQueryDBConnCustom) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
++	return d.inner.ExecContext(ctx, query, args...)
++}
++
++func (d panicOnQueryDBConnCustom) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
++	if containsSubstr(query, d.trigger) {
++		panic(d.msg)
++	}
++	return d.inner.QueryContext(ctx, query, args...)
++}
++
++func (d panicOnQueryDBConnCustom) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
++	return d.inner.QueryRowContext(ctx, query, args...)
++}
++
++// TestRekeyAuxRowIDsPendingSkipsDriftedTable is the loop-level #4380
++// regression: when one table drifts (dolt#11131), the pass skips it with a
++// warning and returns no error \u2014 the migration completes and the database
++// opens \u2014 while the remaining tables are still processed and the in-progress
++// sentinel is left set so a later pass resumes the skipped table.
++func TestRekeyAuxRowIDsPendingSkipsDriftedTable(t *testing.T) {
++	db2, mock2, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db2.Close()
++
++	// auxRekeyResumePending: local_metadata table absent -> COUNT 0.
++	mock2.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
++
++	// setAuxRekeyInProgress: CREATE TABLE IF NOT EXISTS + REPLACE INTO.
++	mock2.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
++		WillReturnResult(sqlmock.NewResult(0, 0))
++	mock2.ExpectExec(`REPLACE INTO local_metadata`).
++		WillReturnResult(sqlmock.NewResult(0, 1))
++
++	// Table loop. Order: events, comments, issue_snapshots, compaction_snapshots.
++	// events: column probe -> absent -> skip cleanly.
++	expectColumnExists(mock2, false)
++	// comments: column probe -> present, then the SELECT panics (drift).
++	expectColumnExists(mock2, true)
++	// (the comments SELECT is intercepted by the panic wrapper, never reaches mock2)
++	// issue_snapshots: absent -> skip.
++	expectColumnExists(mock2, false)
++	// compaction_snapshots: absent -> skip.
++	expectColumnExists(mock2, false)
++
++	conn := panicOnQueryDBConn{inner: db2, trigger: "FROM comments", panicQuery: true}
++
++	// markerVersion 9 is pending; mainVersionBefore below the watershed.
++	pending := []int{auxRekeyPassInitial.markerVersion}
++	wrote, err := rekeyAuxRowIDsPending(context.Background(), conn,
++		auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial, pending)
++	if err != nil {
++		t.Fatalf("drifted table must not abort the pass, got err=%v", err)
++	}
++	if wrote {
++		t.Fatalf("no table should have been rewritten (all skipped/drifted), got wrote=%v", wrote)
++	}
++	if err := mock2.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet expectations: %v", err)
++	}
++}
+diff --git a/internal/storage/schema/aux_row_id_backfill.go b/internal/storage/schema/aux_row_id_backfill.go
+index f562e814..f79745a9 100644
+--- a/internal/storage/schema/aux_row_id_backfill.go
++++ b/internal/storage/schema/aux_row_id_backfill.go
+@@ -3,13 +3,49 @@ package schema
+ import (
+ 	"context"
+ 	"database/sql"
++	"errors"
+ 	"fmt"
++	"os"
+ 	"sort"
+ 	"strings"
+ 
+ 	"github.com/steveyegge/beads/internal/storage/rowid"
+ )
+ 
++// errAuxRowEncodingDrift marks a table that could not be re-keyed because its
++// on-disk history/comments encoding has drifted in a way the storage engine
++// cannot decode (dolt#11131): reading or writing a row panics deep in the
++// engine with "invalid hash length". Rather than let that panic abort the
++// whole migration pass — which left the database unopenable on every start,
++// with no forward or backward path (#4380) — the re-key recovers it, skips the
++// drifted table with a warning, records the skip clone-locally, and relies on
++// a later convergence pass to retry it once the drift is gone.
++var errAuxRowEncodingDrift = errors.New("aux row encoding drift (dolt#11131)")
++
++// auxRowEncodingDriftMarker is the dolt-engine panic string emitted when a
++// table's row encoding has drifted beyond what it can decode. It is matched as
++// a substring because the engine wraps it with positional context.
++const auxRowEncodingDriftMarker = "invalid hash length"
++
++// isAuxRowEncodingDrift reports whether a recovered panic value is the
++// dolt#11131 encoding-drift panic (as opposed to any other, genuinely fatal
++// bug we must not swallow).
++func isAuxRowEncodingDrift(r any) bool {
++	if r == nil {
++		return false
++	}
++	var msg string
++	switch v := r.(type) {
++	case error:
++		msg = v.Error()
++	case string:
++		msg = v
++	default:
++		msg = fmt.Sprintf("%v", v)
++	}
++	return strings.Contains(msg, auxRowEncodingDriftMarker)
++}
++
+ // auxRekeyPass names one clone-local convergence pass over the aux tables.
+ // Each pass is gated three ways (bd-578h9): markerVersion is the ignored
+ // (clone-local) migration that records the pass's completion — the rewrite
+@@ -248,20 +284,68 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
+ 	}
+ 
+ 	wrote := false
++	drifted := false
+ 	for _, t := range auxRekeyTables {
+ 		w, err := rekeyAuxRowTable(ctx, db, t)
+ 		wrote = wrote || w
+ 		if err != nil {
++			// dolt#11131: the table's on-disk encoding has drifted beyond
++			// what the storage engine can decode. Skipping it (with a
++			// warning) keeps the migration — and the database open — alive
++			// on a database that would otherwise panic on every single start
++			// with no way forward or back (#4380). The skip is retried by a
++			// later convergence pass over the same tables, so the row ids
++			// still converge once the drift clears.
++			if errors.Is(err, errAuxRowEncodingDrift) {
++				drifted = true
++				fmt.Fprintf(os.Stderr,
++					"warning: skipping aux row re-key for table %q: on-disk encoding drift (dolt#11131); the database opens normally and the re-key is retried on a later pass (#4380): %v\n",
++					t.name, err)
++				continue
++			}
+ 			return wrote, fmt.Errorf("%s: %w", t.name, err)
+ 		}
+ 	}
++	// A drifted table was skipped: leave the in-progress sentinel set so a
++	// later pass knows this pass's rewrite never finished and resumes it,
++	// rather than recording the pass as converged over a table it could not
++	// touch. The main-source migration pass still completes and the database
++	// opens.
++	if drifted {
++		return wrote, nil
++	}
+ 	if err := clearAuxRekeyInProgress(ctx, db, pass.sentinelKey); err != nil {
+ 		return wrote, fmt.Errorf("clearing aux rekey sentinel: %w", err)
+ 	}
+ 	return wrote, nil
+ }
+ 
+-// rekeyAuxRowTable re-derives the ids of one table. The whole table is grouped
++// rekeyAuxRowTable re-derives the ids of one table, recovering from the
++// dolt#11131 encoding-drift panic. On that panic it returns
++// errAuxRowEncodingDrift so the caller can skip the drifted table instead of
++// crashing the whole migration pass (and the database open with it). The
++// recover is scoped to a single table so a drift in one table never hides a
++// genuine panic in another.
++func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (wrote bool, err error) {
++	defer func() {
++		if r := recover(); r != nil {
++			if isAuxRowEncodingDrift(r) {
++				wrote = false
++				err = fmt.Errorf("%w: %v", errAuxRowEncodingDrift, r)
++				return
++			}
++			// Not the drift we know how to survive: re-panic so a real bug
++			// still surfaces instead of being silently swallowed.
++			panic(r)
++		}
++	}()
++	return rekeyAuxRowTableUnsafe(ctx, db, t)
++}
++
++// rekeyAuxRowTableUnsafe performs the actual re-key. It may panic deep in the
++// storage engine when a row's encoding has drifted (dolt#11131); callers must
++// invoke it through rekeyAuxRowTable, which recovers that panic.
++// The grouping algorithm: the whole table is grouped
+ // by content digest; each digest's rows take the deterministic ids for
+ // ordinals 0..n-1. A row already holding one of its group's target ids keeps
+ // it (idempotence: re-running never swaps ids within a group), and the
+@@ -269,7 +353,7 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
+ // clones that assignment may permute within a group of exact-duplicate rows,
+ // but duplicates are interchangeable and the id set is identical, so the
+ // merged result still converges.
+-func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (bool, error) {
++func rekeyAuxRowTableUnsafe(ctx context.Context, db DBConn, t auxRekeyTable) (bool, error) {
+ 	// Skip cleanly if the table or its id column isn't present (older or partial
+ 	// schema): nothing to re-key. After MigrateUp's main pass the id column is
+ 	// CHAR(36) on any schema this runs against (0037 precedes the marker).

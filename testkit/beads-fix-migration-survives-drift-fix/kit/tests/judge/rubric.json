@@ -1,0 +1,17 @@
+{
+  "files": [
+    "internal/storage/schema/aux_row_id_backfill.go",
+    "internal/storage/schema/schema.go"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "retry_pass_guard_exemption_matches_the_rewritten_tables",
+      "description": "On the later migration pass that retries a table skipped for undecodable storage, MigrateUp's pre-existing-dirty and changed-signature guards (which read dirty tables through dolt_diff before any migration runs) treat the retried table as this pass's own migration state, so a dirty drifted table does not fail the open on that read. The exemption is scoped to exactly the tables the upcoming re-key will rewrite on that pass. Accept any structure (a helper returning the table set, an inlined selection, or a result threaded back from the re-key) as long as the exemption is in place before those guards read the table and covers no more than the tables being rewritten. REJECT a fix that leaves the retried table in the guards' pre-read, and REJECT a blanket exemption of all four aux tables whenever any retry is pending, because that drops a non-drifted aux table's pre-existing user edits into the 'schema: apply migrations' commit."
+    },
+    {
+      "name": "skip_is_surfaced_through_a_non_discarded_channel",
+      "description": "When the re-key skips an undecodable table, the fix emits an operator-visible notice that names the table, through a sink that is not suppressed for non-interactive callers: the standard logger, a structured logger, or stderr directly all qualify. The skipped table keeps its old, cross-clone-divergent ids until the storage is repaired and a later pass finishes it, and the callers who most need to know (piped commands and CI runs) are the ones a TTY-gated progress writer discards. Accept any non-discarded mechanism and any wording. REJECT a fix that skips silently or writes the notice only to a TTY-gated progress or spinner channel, or only behind a debug flag."
+    }
+  ],
+  "pass_to_pass": []
+}

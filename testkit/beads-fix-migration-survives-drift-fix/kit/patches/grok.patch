@@ -1,0 +1,679 @@
+diff --git a/internal/storage/schema/aux_row_id_backfill.go b/internal/storage/schema/aux_row_id_backfill.go
+index f562e814..149f60e9 100644
+--- a/internal/storage/schema/aux_row_id_backfill.go
++++ b/internal/storage/schema/aux_row_id_backfill.go
+@@ -3,7 +3,9 @@ package schema
+ import (
+ 	"context"
+ 	"database/sql"
++	"errors"
+ 	"fmt"
++	"log"
+ 	"sort"
+ 	"strings"
+ 
+@@ -56,6 +58,19 @@ var auxRekeyPassDerivedInsert = auxRekeyPass{
+ // them.
+ var auxRekeyPasses = []auxRekeyPass{auxRekeyPassInitial, auxRekeyPassDerivedInsert}
+ 
++// auxRekeyDriftedKey is the clone-local local_metadata key that lists aux
++// tables the re-key skipped because reading them panicked with dolt#11131
++// encoding drift ("invalid hash length"). The migration still completes so
++// the database stays openable; listed tables are retried on later MigrateUp
++// passes and are exempted from the changed-signature dirty-table guard
++// (#4380).
++const auxRekeyDriftedKey = "aux_row_rekey_drifted"
++
++// errDoltEncodingDrift marks a table whose TEXT/LONGTEXT cells cannot be
++// read because an earlier unguarded ALTER flipped the on-disk storage
++// encoding tag (dolt#11131). Callers skip the table instead of aborting.
++var errDoltEncodingDrift = errors.New("dolt encoding drift")
++
+ // auxRekeyResumePending reports whether a previous run of this re-key pass on
+ // this clone recorded the in-progress sentinel and never cleared it. A missing
+ // local_metadata table means no sentinel: the table is dolt-ignored and
+@@ -133,6 +148,107 @@ func clearAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string)
+ 	return err
+ }
+ 
++// loadAuxRekeyDrifted returns the aux tables previously skipped for dolt#11131
++// encoding drift. A missing local_metadata table or key means nothing is
++// pending retry.
++func loadAuxRekeyDrifted(ctx context.Context, db DBConn) ([]string, error) {
++	var tableCount int
++	if err := db.QueryRowContext(ctx,
++		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
++		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
++	).Scan(&tableCount); err != nil {
++		return nil, err
++	}
++	if tableCount == 0 {
++		return nil, nil
++	}
++	var value sql.NullString
++	err := db.QueryRowContext(ctx,
++		"SELECT value FROM local_metadata WHERE `key` = ?",
++		auxRekeyDriftedKey).Scan(&value)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	return parseAuxRekeyDriftedValue(value.String), nil
++}
++
++func parseAuxRekeyDriftedValue(value string) []string {
++	if strings.TrimSpace(value) == "" {
++		return nil
++	}
++	parts := strings.Split(value, ",")
++	out := make([]string, 0, len(parts))
++	seen := make(map[string]bool, len(parts))
++	for _, p := range parts {
++		name := strings.TrimSpace(p)
++		if name == "" || seen[name] {
++			continue
++		}
++		seen[name] = true
++		out = append(out, name)
++	}
++	sort.Strings(out)
++	return out
++}
++
++func storeAuxRekeyDrifted(ctx context.Context, db DBConn, tables []string) error {
++	if _, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS local_metadata (`key` VARCHAR(255) PRIMARY KEY, value TEXT NOT NULL DEFAULT '')"); err != nil {
++		return fmt.Errorf("ensuring local_metadata: %w", err)
++	}
++	tables = parseAuxRekeyDriftedValue(strings.Join(tables, ","))
++	if len(tables) == 0 {
++		_, err := db.ExecContext(ctx,
++			"DELETE FROM local_metadata WHERE `key` = ?",
++			auxRekeyDriftedKey)
++		return err
++	}
++	_, err := db.ExecContext(ctx,
++		"REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)",
++		auxRekeyDriftedKey, strings.Join(tables, ","))
++	return err
++}
++
++func recordAuxRekeyDrifted(ctx context.Context, db DBConn, table string) error {
++	existing, err := loadAuxRekeyDrifted(ctx, db)
++	if err != nil {
++		return err
++	}
++	return storeAuxRekeyDrifted(ctx, db, append(existing, table))
++}
++
++func clearAuxRekeyDriftedTable(ctx context.Context, db DBConn, table string) error {
++	existing, err := loadAuxRekeyDrifted(ctx, db)
++	if err != nil {
++		return err
++	}
++	if len(existing) == 0 {
++		return nil
++	}
++	next := existing[:0]
++	found := false
++	for _, name := range existing {
++		if name == table {
++			found = true
++			continue
++		}
++		next = append(next, name)
++	}
++	if !found {
++		return nil
++	}
++	return storeAuxRekeyDrifted(ctx, db, next)
++}
++
++// isInvalidHashLengthPanic reports whether r is the dolt#11131 panic raised
++// when an adaptive-encoding reader decodes a cell still stored under the
++// legacy address layout (or the reverse flip).
++func isInvalidHashLengthPanic(r any) bool {
++	return strings.Contains(fmt.Sprint(r), "invalid hash length")
++}
++
+ // auxRekeyTable describes one table covered by the re-key. columns is the
+ // frozen SELECT list of every non-id column, in creation order, with datetime
+ // columns CAST to CHAR server-side so the scanned text is identical across
+@@ -191,6 +307,10 @@ var auxRekeyTables = []auxRekeyTable{
+ // mainVersionBefore is the main-source cursor as it stood before this pass's
+ // migrations ran; at or past auxRowRekeyShippedMainVersion the rewrite is
+ // skipped (see that constant).
++//
++// Tables that panic with dolt#11131 encoding drift are skipped with a warning,
++// recorded under aux_row_rekey_drifted, and retried on later passes so the
++// migration can still complete and the database stays openable (#4380).
+ func rekeyAuxRowIDs(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass) (bool, error) {
+ 	pending, err := ignoredSource.pendingVersions(ctx, db)
+ 	if err != nil {
+@@ -225,9 +345,21 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
+ 			break
+ 		}
+ 	}
++	drifted, err := loadAuxRekeyDrifted(ctx, db)
++	if err != nil {
++		return false, fmt.Errorf("reading aux rekey drift record: %w", err)
++	}
++
++	// Marker already recorded: still retry tables previously skipped for
++	// encoding drift so a later migration pass can converge them once the
++	// underlying cells become readable (or keep skipping safely if not).
+ 	if !markerPending {
+-		return false, nil
++		if len(drifted) == 0 {
++			return false, nil
++		}
++		return rekeyAuxRowDriftedTables(ctx, db, drifted)
+ 	}
++
+ 	resume, err := auxRekeyResumePending(ctx, db, pass.sentinelKey)
+ 	if err != nil {
+ 		return false, fmt.Errorf("reading aux rekey sentinel: %w", err)
+@@ -247,16 +379,75 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
+ 		return false, fmt.Errorf("recording aux rekey sentinel: %w", err)
+ 	}
+ 
+-	wrote := false
++	wrote, err := rekeyAuxRowTables(ctx, db, auxRekeyTables)
++	if err != nil {
++		return wrote, err
++	}
++	if err := clearAuxRekeyInProgress(ctx, db, pass.sentinelKey); err != nil {
++		return wrote, fmt.Errorf("clearing aux rekey sentinel: %w", err)
++	}
++	return wrote, nil
++}
++
++// rekeyAuxRowDriftedTables retries only the tables listed in the clone-local
++// drift record. No in-progress sentinel is used: the one-time marker already
++// recorded the pass, and each table rewrite is itself idempotent.
++func rekeyAuxRowDriftedTables(ctx context.Context, db DBConn, drifted []string) (bool, error) {
++	byName := make(map[string]auxRekeyTable, len(auxRekeyTables))
+ 	for _, t := range auxRekeyTables {
++		byName[t.name] = t
++	}
++	tables := make([]auxRekeyTable, 0, len(drifted))
++	for _, name := range drifted {
++		t, ok := byName[name]
++		if !ok {
++			// Drop unknown names so a hand-edited record cannot stall forever.
++			if err := clearAuxRekeyDriftedTable(ctx, db, name); err != nil {
++				return false, fmt.Errorf("clearing unknown drifted table %s: %w", name, err)
++			}
++			continue
++		}
++		tables = append(tables, t)
++	}
++	if len(tables) == 0 {
++		return false, nil
++	}
++	return rekeyAuxRowTables(ctx, db, tables)
++}
++
++func rekeyAuxRowTables(ctx context.Context, db DBConn, tables []auxRekeyTable) (bool, error) {
++	// Snapshot the pending drift set once so a successful rewrite can drop its
++	// entry without a local_metadata round-trip on every clean table.
++	pendingDrift, err := loadAuxRekeyDrifted(ctx, db)
++	if err != nil {
++		return false, fmt.Errorf("reading aux rekey drift record: %w", err)
++	}
++	pendingSet := make(map[string]bool, len(pendingDrift))
++	for _, name := range pendingDrift {
++		pendingSet[name] = true
++	}
++
++	wrote := false
++	for _, t := range tables {
+ 		w, err := rekeyAuxRowTable(ctx, db, t)
+ 		wrote = wrote || w
+ 		if err != nil {
++			if errors.Is(err, errDoltEncodingDrift) {
++				log.Printf("schema: skipping aux rekey of %s due to dolt encoding drift (%v); recorded for retry", t.name, err)
++				if recErr := recordAuxRekeyDrifted(ctx, db, t.name); recErr != nil {
++					return wrote, fmt.Errorf("recording aux rekey drift for %s: %w", t.name, recErr)
++				}
++				pendingSet[t.name] = true
++				continue
++			}
+ 			return wrote, fmt.Errorf("%s: %w", t.name, err)
+ 		}
+-	}
+-	if err := clearAuxRekeyInProgress(ctx, db, pass.sentinelKey); err != nil {
+-		return wrote, fmt.Errorf("clearing aux rekey sentinel: %w", err)
++		if pendingSet[t.name] {
++			if err := clearAuxRekeyDriftedTable(ctx, db, t.name); err != nil {
++				return wrote, fmt.Errorf("clearing aux rekey drift for %s: %w", t.name, err)
++			}
++			delete(pendingSet, t.name)
++		}
+ 	}
+ 	return wrote, nil
+ }
+@@ -269,7 +460,30 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
+ // clones that assignment may permute within a group of exact-duplicate rows,
+ // but duplicates are interchangeable and the id set is identical, so the
+ // merged result still converges.
+-func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (bool, error) {
++//
++// On storage affected by dolt#11131, reading a drifted TEXT/LONGTEXT cell
++// panics with "invalid hash length". That panic is recovered here and returned
++// as errDoltEncodingDrift so the caller can skip the table instead of aborting
++// the whole migration (#4380).
++func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (wrote bool, err error) {
++	var rows *sql.Rows
++	// Only convert dolt#11131 panics raised while READING cells. A panic
++	// mid-UPDATE means a partial rewrite may already be staged; re-panic so
++	// the in-progress sentinel stays set and the next pass resumes.
++	reading := true
++	defer func() {
++		if rows != nil {
++			_ = rows.Close()
++		}
++		if r := recover(); r != nil {
++			if reading && isInvalidHashLengthPanic(r) {
++				err = fmt.Errorf("%w: %v", errDoltEncodingDrift, r)
++				return
++			}
++			panic(r)
++		}
++	}()
++
+ 	// Skip cleanly if the table or its id column isn't present (older or partial
+ 	// schema): nothing to re-key. After MigrateUp's main pass the id column is
+ 	// CHAR(36) on any schema this runs against (0037 precedes the marker).
+@@ -282,8 +496,11 @@ func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (bool, er
+ 	}
+ 
+ 	//nolint:gosec // G201: name/columns come from the hardcoded auxRekeyTables, never user input.
+-	rows, err := db.QueryContext(ctx, fmt.Sprintf(`SELECT id, %s FROM %s`, t.columns, t.name))
++	rows, err = db.QueryContext(ctx, fmt.Sprintf(`SELECT id, %s FROM %s`, t.columns, t.name))
+ 	if err != nil {
++		if isInvalidHashLengthPanic(err.Error()) {
++			return false, fmt.Errorf("%w: %v", errDoltEncodingDrift, err)
++		}
+ 		return false, err
+ 	}
+ 	nFields := strings.Count(t.columns, ",") + 1
+@@ -298,14 +515,29 @@ func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (bool, er
+ 		}
+ 		if err := rows.Scan(dests...); err != nil {
+ 			_ = rows.Close()
++			rows = nil
++			if isInvalidHashLengthPanic(err.Error()) {
++				return false, fmt.Errorf("%w: %v", errDoltEncodingDrift, err)
++			}
+ 			return false, err
+ 		}
+ 		digest := rowid.Digest(fields)
+ 		groups[digest] = append(groups[digest], id)
+ 	}
+-	_ = rows.Close()
+-	if err := rows.Err(); err != nil {
+-		return false, err
++	closeErr := rows.Close()
++	iterErr := rows.Err()
++	rows = nil
++	if closeErr != nil {
++		return false, closeErr
++	}
++	// A panic during Next/Scan takes the recover path above. If the driver
++	// surfaces the decode failure as an error instead, treat the same
++	// dolt#11131 signature as encoding drift so the table is skipped.
++	if iterErr != nil {
++		if isInvalidHashLengthPanic(iterErr.Error()) {
++			return false, fmt.Errorf("%w: %v", errDoltEncodingDrift, iterErr)
++		}
++		return false, iterErr
+ 	}
+ 
+ 	type rekey struct{ oldID, newID string }
+@@ -342,6 +574,7 @@ func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (bool, er
+ 	// Deterministic UPDATE order (groups is a map) so runs are reproducible.
+ 	sort.Slice(todo, func(i, j int) bool { return todo[i].oldID < todo[j].oldID })
+ 
++	reading = false
+ 	for _, r := range todo {
+ 		//nolint:gosec // G201: table name is a hardcoded constant, never user input.
+ 		if _, err := db.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET id = ? WHERE id = ?`, t.name),
+diff --git a/internal/storage/schema/aux_row_id_backfill_test.go b/internal/storage/schema/aux_row_id_backfill_test.go
+index 84ac7549..2f525495 100644
+--- a/internal/storage/schema/aux_row_id_backfill_test.go
++++ b/internal/storage/schema/aux_row_id_backfill_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"errors"
++	"fmt"
+ 	"regexp"
+ 	"testing"
+ 
+@@ -203,7 +204,9 @@ func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion)
+ 	expectIgnoredSentinelProbes(mock, true)
+-	// No further expectations: no table may be probed or scanned.
++	expectNoAuxRekeyDrift(mock)
++	// No further expectations: marker recorded and no drift pending, so no
++	// table may be probed or scanned.
+ 
+ 	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
+ 	if err != nil {
+@@ -230,8 +233,10 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion-1)
+ 	expectIgnoredSentinelProbes(mock, true)
++	expectNoAuxRekeyDrift(mock)
+ 	expectAuxRekeySentinel(mock, false)
+ 	expectSetAuxRekeySentinel(mock)
++	expectNoAuxRekeyDrift(mock) // rekeyAuxRowTables snapshots pending drift
+ 	// Each of the four tables is probed; this mocked world has none of them,
+ 	// so each probe returns 0 and the loop completes without scanning.
+ 	for range auxRekeyTables {
+@@ -251,6 +256,41 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
+ 	}
+ }
+ 
++// expectNoAuxRekeyDrift mocks loadAuxRekeyDrifted when local_metadata is absent
++// (the common fresh-clone path: nothing previously skipped).
++func expectNoAuxRekeyDrift(mock sqlmock.Sqlmock) {
++	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++}
++
++// expectAuxRekeyDrift mocks loadAuxRekeyDrifted returning tables (comma-separated)
++// or sql.ErrNoRows when tables is empty but the local_metadata table exists.
++func expectAuxRekeyDrift(mock sqlmock.Sqlmock, tables string) {
++	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
++	q := mock.ExpectQuery(regexp.QuoteMeta("SELECT value FROM local_metadata WHERE `key` = ?")).
++		WithArgs(auxRekeyDriftedKey)
++	if tables == "" {
++		q.WillReturnError(sql.ErrNoRows)
++		return
++	}
++	q.WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(tables))
++}
++
++func expectStoreAuxRekeyDrift(mock sqlmock.Sqlmock, value string) {
++	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
++		WillReturnResult(sqlmock.NewResult(0, 0))
++	if value == "" {
++		mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
++			WithArgs(auxRekeyDriftedKey).
++			WillReturnResult(sqlmock.NewResult(0, 1))
++		return
++	}
++	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)")).
++		WithArgs(auxRekeyDriftedKey, value).
++		WillReturnResult(sqlmock.NewResult(0, 1))
++}
++
+ // expectAuxRekeySentinel mocks auxRekeyResumePending: the local_metadata
+ // table-existence probe, then (when the table exists) the sentinel-row count.
+ func expectAuxRekeySentinel(mock sqlmock.Sqlmock, pending bool) {
+@@ -297,6 +337,7 @@ func TestRekeyAuxRowIDsSkipsConvergedLineage(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion-1)
+ 	expectIgnoredSentinelProbes(mock, true)
++	expectNoAuxRekeyDrift(mock)
+ 	expectAuxRekeySentinel(mock, false)
+ 	// No further expectations: marker is pending, but the pre-pass main
+ 	// cursor at the watershed and no crash sentinel means no table may be
+@@ -331,8 +372,10 @@ func TestRekeyAuxRowIDsResumesAfterCrash(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion-1)
+ 	expectIgnoredSentinelProbes(mock, true)
++	expectNoAuxRekeyDrift(mock)
+ 	expectAuxRekeySentinel(mock, true)
+ 	expectSetAuxRekeySentinel(mock)
++	expectNoAuxRekeyDrift(mock) // rekeyAuxRowTables snapshots pending drift
+ 	for range auxRekeyTables {
+ 		expectColumnExists(mock, false)
+ 	}
+@@ -362,8 +405,10 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion-1)
+ 	expectIgnoredSentinelProbes(mock, true)
++	expectNoAuxRekeyDrift(mock)
+ 	expectAuxRekeySentinel(mock, false)
+ 	expectSetAuxRekeySentinel(mock)
++	expectNoAuxRekeyDrift(mock) // rekeyAuxRowTables snapshots pending drift
+ 	// First table probe fails; no DELETE of the sentinel may follow.
+ 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
+ 		WillReturnError(errors.New("boom"))
+@@ -375,3 +420,151 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
+ 		t.Fatalf("unmet sql expectations: %v", err)
+ 	}
+ }
++
++func TestIsInvalidHashLengthPanic(t *testing.T) {
++	if !isInvalidHashLengthPanic("invalid hash length: 19") {
++		t.Fatal("string form should match")
++	}
++	if !isInvalidHashLengthPanic(errors.New("invalid hash length: 1")) {
++		t.Fatal("error form should match")
++	}
++	if isInvalidHashLengthPanic("something else") {
++		t.Fatal("unrelated value must not match")
++	}
++}
++
++// TestRekeyAuxRowTableClassifiesInvalidHashLengthError covers the non-panic
++// form of dolt#11131: some driver paths surface the bad cell as an error
++// string instead of a panic. Either form must become errDoltEncodingDrift so
++// the table can be skipped instead of aborting MigrateUp (#4380).
++func TestRekeyAuxRowTableClassifiesInvalidHashLengthError(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	expectColumnExists(mock, true)
++	expectCommentsSelect(mock).
++		WillReturnError(errors.New("invalid hash length: 19"))
++
++	wrote, err := rekeyAuxRowTable(context.Background(), db, commentsTable)
++	if wrote {
++		t.Error("expected wrote=false when the SELECT failed before any UPDATE")
++	}
++	if !errors.Is(err, errDoltEncodingDrift) {
++		t.Fatalf("err = %v, want errDoltEncodingDrift", err)
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
++
++// TestRekeyAuxRowTableRecoversInvalidHashLengthPanic covers the panic form of
++// dolt#11131: hash.New panics mid-scan. The recover path must convert it to
++// errDoltEncodingDrift so MigrateUp can skip the table instead of aborting.
++func TestRekeyAuxRowTableRecoversInvalidHashLengthPanic(t *testing.T) {
++	// Drive the recover path directly: a helper that panics with the upstream
++	// message must be classified the same way a live Dolt scan would.
++	err := func() (err error) {
++		defer func() {
++			if r := recover(); r != nil {
++				if isInvalidHashLengthPanic(r) {
++					err = fmt.Errorf("%w: %v", errDoltEncodingDrift, r)
++					return
++				}
++				panic(r)
++			}
++		}()
++		panic("invalid hash length: 19")
++	}()
++	if !errors.Is(err, errDoltEncodingDrift) {
++		t.Fatalf("err = %v, want errDoltEncodingDrift", err)
++	}
++}
++
++// TestRekeyAuxRowTablesSkipsDriftedTable verifies the #4380 skip path: a table
++// that surfaces encoding drift is recorded under aux_row_rekey_drifted and the
++// pass continues with the remaining tables instead of aborting.
++func TestRekeyAuxRowTablesSkipsDriftedTable(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	expectNoAuxRekeyDrift(mock)
++
++	// events drifts
++	expectColumnExists(mock, true)
++	mock.ExpectQuery(regexp.QuoteMeta(
++		"SELECT id, issue_id, event_type, actor, old_value, new_value, comment, CAST(created_at AS CHAR) FROM events")).
++		WillReturnError(errors.New("invalid hash length: 19"))
++	// recordAuxRekeyDrifted: load existing (none) then store "events"
++	expectNoAuxRekeyDrift(mock)
++	expectStoreAuxRekeyDrift(mock, "events")
++
++	// comments: missing id column — clean skip, no drift clear needed
++	expectColumnExists(mock, false)
++
++	wrote, err := rekeyAuxRowTables(context.Background(), db, auxRekeyTables[:2])
++	if err != nil {
++		t.Fatalf("rekeyAuxRowTables: %v", err)
++	}
++	if wrote {
++		t.Error("expected wrote=false when only a drifted/missing table was seen")
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
++
++// TestRekeyAuxRowIDsRetriesDriftedAfterMarkerRecorded verifies that once the
++// one-time marker is recorded, a later MigrateUp still retries tables listed
++// in aux_row_rekey_drifted (#4380).
++func TestRekeyAuxRowIDsRetriesDriftedAfterMarkerRecorded(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassInitial.markerVersion)
++	expectIgnoredSentinelProbes(mock, true)
++	expectAuxRekeyDrift(mock, "comments")
++
++	// rekeyAuxRowDriftedTables -> rekeyAuxRowTables snapshots drift again
++	expectAuxRekeyDrift(mock, "comments")
++	expectColumnExists(mock, true)
++	expectCommentsSelect(mock).
++		WillReturnRows(sqlmock.NewRows([]string{"id", "issue_id", "author", "text", "created_at"}).
++			AddRow(rowid.New("comments", 0, commentDigest("bd-1", "steve", "first", "2026-06-09 12:00:00")),
++				"bd-1", "steve", "first", "2026-06-09 12:00:00"))
++	// already holding target id -> no UPDATE; clear drift entry
++	expectAuxRekeyDrift(mock, "comments") // clearAuxRekeyDriftedTable loads
++	expectStoreAuxRekeyDrift(mock, "")
++
++	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial)
++	if err != nil {
++		t.Fatalf("rekeyAuxRowIDs: %v", err)
++	}
++	if wrote {
++		t.Error("expected wrote=false when the drifted table was already converged")
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
++
++func TestParseAuxRekeyDriftedValue(t *testing.T) {
++	got := parseAuxRekeyDriftedValue(" comments,events, comments ")
++	want := []string{"comments", "events"}
++	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
++		t.Fatalf("got %v want %v", got, want)
++	}
++	if parseAuxRekeyDriftedValue("") != nil {
++		t.Fatal("empty should be nil")
++	}
++}
+diff --git a/internal/storage/schema/lock_test.go b/internal/storage/schema/lock_test.go
+index 5209578c..9748f3cd 100644
+--- a/internal/storage/schema/lock_test.go
++++ b/internal/storage/schema/lock_test.go
+@@ -373,6 +373,9 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
+ 	expectDoltStatusRows(mock)
+ 	// MigrateUp probes the aux-rekey crash sentinel (bd-578h9.16); this
+ 	// mocked world has no local_metadata table, so no crashed pass.
++	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	// loadAuxRekeyDrifted: same missing local_metadata table => no drift pending (#4380).
+ 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+ 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+ 	// MigrateUp captures the pre-pass main cursor for the aux re-key
+@@ -425,10 +428,17 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
+ 	expectColumnExists(mock, false)
+ 	expectColumnExists(mock, false)
+ 	// rekeyAuxRowIDs reads the ignored cursor to see whether its clone-local
+-	// marker is pending; at latest it is not, so the re-key no-ops.
++	// marker is pending; at latest it is not, so the re-key no-ops — except
++	// each pass still consults the clone-local drift record (#4380) so a
++	// previously skipped table can be retried.
+ 	expectCursorProbe(mock, "ignored_schema_migrations", true)
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
+ 	expectIgnoredSentinelProbes(mock, true)
++	for range auxRekeyPasses {
++		// loadAuxRekeyDrifted: no local_metadata => nothing pending retry.
++		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	}
+ 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS ignored_schema_migrations").
+ 		WillReturnResult(sqlmock.NewResult(0, 0))
+ 	expectContentHashColumnExists(mock)
+@@ -526,6 +536,9 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
+ 	// committableDirtyTables re-reads dolt_status (ignored tables excluded).
+ 	expectDoltStatusDirtyEvents(mock)
+ 	// auxRekeyResumePending: no local_metadata table, no crashed rekey pass.
++	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	// loadAuxRekeyDrifted: same missing local_metadata table => no drift pending (#4380).
+ 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+ 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+ 	// pendingMigrationDirtyTables: cursor read, then pending 0062's SQL
+diff --git a/internal/storage/schema/schema.go b/internal/storage/schema/schema.go
+index 6779c1b7..5d49d48a 100644
+--- a/internal/storage/schema/schema.go
++++ b/internal/storage/schema/schema.go
+@@ -671,6 +671,17 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+ 			delete(dirtyBefore, t.name)
+ 		}
+ 	}
++	// Tables previously skipped for dolt#11131 encoding drift are about to be
++	// retried by the aux re-key. Their working-set diffs are migration state,
++	// not pre-existing user writes: exempt them from the changed-signature
++	// guard so a retry cannot re-brick the database (#4380).
++	if drifted, err := loadAuxRekeyDrifted(ctx, db); err != nil {
++		return 0, fmt.Errorf("reading aux rekey drift record: %w", err)
++	} else {
++		for _, name := range drifted {
++			delete(dirtyBefore, name)
++		}
++	}
+ 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
+ 	if err != nil {
+ 		return 0, fmt.Errorf("checking dirty tables against pending migrations: %w", err)
+diff --git a/internal/storage/schema/schema_test.go b/internal/storage/schema/schema_test.go
+index 7b4aad28..09154607 100644
+--- a/internal/storage/schema/schema_test.go
++++ b/internal/storage/schema/schema_test.go
+@@ -85,6 +85,9 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T)
+ 	expectDirtyDoltStatusRow(mock, "dependencies", false)
+ 
+ 	// auxRekeyResumePending: no local_metadata table, so no resume in flight.
++	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	// loadAuxRekeyDrifted: same missing local_metadata table => no drift pending (#4380).
+ 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+ 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+ 

@@ -1,0 +1,1310 @@
+diff --git a/internal/storage/schema/aux_row_id_backfill.go b/internal/storage/schema/aux_row_id_backfill.go
+index f562e8141..07357bd0c 100644
+--- a/internal/storage/schema/aux_row_id_backfill.go
++++ b/internal/storage/schema/aux_row_id_backfill.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"fmt"
++	"log"
++	"slices"
+ 	"sort"
+ 	"strings"
+ 
+@@ -53,62 +55,174 @@ var auxRekeyPassDerivedInsert = auxRekeyPass{
+ }
+ 
+ // auxRekeyPasses lists every convergence pass, in the order MigrateUp runs
+-// them.
++// them. Every pass here runs the identical rekeyAuxRowTable rewrite over the
++// identical auxRekeyTables set (see auxRowRekeyDriftedKey) — a future pass
++// that rewrites a different table set or a different derivation must not be
++// added to this list without also giving it its own drift record; sharing
++// auxRowRekeyDriftedKey across passes with different table sets or
++// derivations would let one pass clear a drift skip the other pass never
++// actually resolved.
+ var auxRekeyPasses = []auxRekeyPass{auxRekeyPassInitial, auxRekeyPassDerivedInsert}
+ 
+-// auxRekeyResumePending reports whether a previous run of this re-key pass on
+-// this clone recorded the in-progress sentinel and never cleared it. A missing
+-// local_metadata table means no sentinel: the table is dolt-ignored and
+-// therefore clone-local, so a fresh clone lacks it until something recreates
+-// it — setAuxRekeyInProgress creates it on demand.
+-func auxRekeyResumePending(ctx context.Context, db DBConn, sentinelKey string) (bool, error) {
++// A pass's sentinel means "a rewrite is in flight", nothing else. MigrateUp
++// reads the sentinels to exempt the aux tables from the pre-existing-dirty
++// guards, because a crashed pass's own partial UPDATEs are sitting in the
++// working set — so a sentinel must not outlive an actual in-flight rewrite. A
++// drift skip (#4380) therefore clears it like any completed pass and records
++// auxRowRekeyDriftedKey instead.
++//
++// auxRowRekeyDriftedKey is the clone-local record (local_metadata,
++// dolt-ignored) of tables the re-key had to skip because their storage carries
++// dolthub/dolt#11131 encoding drift (#4380): a comma-separated table list,
++// absent when there is nothing skipped.
++//
++// It exists because the skip completes the pass, so MigrateUp records the
++// clone-local marker in that same pass and the marker gate can never re-admit
++// the re-key again. This record is what re-admits it — and it names the
++// affected tables so the resumed pass touches only those, leaving tables that
++// already converged alone.
++//
++// The record is clone-local because each clone has to discover, retry and
++// retire its own skip; the drift itself is not necessarily clone-local, since
++// both halves of it (the column's storage-encoding tag and the row chunks it
++// disagrees with) are committed data that travels on push/pull — migration 0057
++// documents bd's own 0048 as one way a lineage acquires it.
++//
++// This one record is shared by every pass in auxRekeyPasses, which is only
++// correct because every pass runs the identical rekeyAuxRowTable rewrite over
++// the identical auxRekeyTables set (their gates — markerVersion,
++// shippedMainVersion — are all that differ): whichever pass retries a skipped
++// table first does the same work any other pass would have done, and clearing
++// the record on success correctly makes every other pass's retry a no-op.
++const auxRowRekeyDriftedKey = "aux_row_rekey_drifted"
++
++// auxRekeyState is what this clone still owes the re-key: a rewrite that was in
++// flight and never finished, and tables skipped for storage drift. Both live in
++// local_metadata, which is dolt-ignored and therefore clone-local — and, per
++// migration 0030, ephemeral: it is recreated empty by a working-set reset, so
++// "no record" is always a legitimate reading.
++type auxRekeyState struct {
++	resume  bool
++	drifted []string
++}
++
++func (s auxRekeyState) pending() bool { return s.resume || len(s.drifted) > 0 }
++
++// readAuxRekeyState reads the given crash sentinels and the #4380 drift record
++// in one round trip. A missing local_metadata table means nothing is set: the
++// table is dolt-ignored and therefore clone-local, so a fresh clone lacks it
++// until something recreates it — setAuxRekeyInProgress creates it on demand.
++//
++// state.drifted is filtered against auxRekeyTables before it is returned: the
++// drift record is a free-form comma-separated cell, so this is the one place
++// that guarantees every name a caller sees is actually one of the re-keyed
++// tables. Callers rely on that — MigrateUp uses state.drifted directly to
++// exempt tables from the pre-existing-dirty guard, and an unfiltered name
++// there would let a non-aux table bypass those guards and get force-staged
++// into the migration commit.
++func readAuxRekeyState(ctx context.Context, db DBConn, sentinelKeys ...string) (auxRekeyState, error) {
++	var state auxRekeyState
+ 	var tableCount int
+ 	if err := db.QueryRowContext(ctx,
+ 		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+ 		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
+ 	).Scan(&tableCount); err != nil {
+-		return false, err
++		return state, err
+ 	}
+ 	if tableCount == 0 {
+-		return false, nil
++		return state, nil
+ 	}
+-	var n int
+-	if err := db.QueryRowContext(ctx,
+-		"SELECT COUNT(*) FROM local_metadata WHERE `key` = ?",
+-		sentinelKey).Scan(&n); err != nil {
+-		return false, err
++	placeholders := make([]string, 0, len(sentinelKeys)+1)
++	args := make([]any, 0, len(sentinelKeys)+1)
++	for _, key := range sentinelKeys {
++		placeholders = append(placeholders, "?")
++		args = append(args, key)
+ 	}
+-	return n > 0, nil
+-}
+-
+-// anyAuxRekeyResumePending reports whether ANY pass's crash sentinel is still
+-// recorded, with one table probe and at most one row query regardless of how
+-// many passes exist — it feeds MigrateUp's dirty-table exemption, which only
+-// needs to know that some rekey rewrite is about to resume.
+-func anyAuxRekeyResumePending(ctx context.Context, db DBConn) (bool, error) {
+-	var tableCount int
+-	if err := db.QueryRowContext(ctx,
+-		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+-		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
+-	).Scan(&tableCount); err != nil {
+-		return false, err
++	placeholders = append(placeholders, "?")
++	args = append(args, auxRowRekeyDriftedKey)
++	//nolint:gosec // G201: only ? placeholders are interpolated; every value is bound.
++	rows, err := db.QueryContext(ctx,
++		fmt.Sprintf("SELECT `key`, value FROM local_metadata WHERE `key` IN (%s)", strings.Join(placeholders, ", ")),
++		args...)
++	if err != nil {
++		// This is the one place the re-key reads a TEXT cell of local_metadata,
++		// so it is the one place a drifted local_metadata could panic the very
++		// function meant to survive drift. No migration re-encodes that table
++		// today, but degrade to "nothing recorded" rather than re-break the
++		// open path if that ever changes.
++		if isSchemaEncodingDriftErr(err) {
++			return state, nil
++		}
++		return state, err
+ 	}
+-	if tableCount == 0 {
+-		return false, nil
++	defer rows.Close()
++	for rows.Next() {
++		var key, value string
++		if err := rows.Scan(&key, &value); err != nil {
++			// Same drift degradation as the QueryContext and rows.Err() siblings
++			// that bracket this loop: this is the one place the re-key reads a
++			// TEXT cell of local_metadata, so a #11131 decode panic surfacing
++			// here — were a future migration ever to re-encode the table — must
++			// degrade to "nothing recorded" rather than re-break the open path
++			// this defense exists to protect. No reachable input triggers it
++			// today (a Dolt decode panic surfaces via Next/Err, not the Scan of
++			// already-streamed values), so this is purely defensive symmetry.
++			if isSchemaEncodingDriftErr(err) {
++				return auxRekeyState{}, nil
++			}
++			return auxRekeyState{}, err
++		}
++		switch key {
++		case auxRowRekeyDriftedKey:
++			for _, name := range strings.Split(value, ",") {
++				if name = strings.TrimSpace(name); name != "" && auxRekeyTableNames[name] {
++					state.drifted = append(state.drifted, name)
++				}
++			}
++		default:
++			// The query only asks for the requested sentinel keys and the drift
++			// record, so any other returned key is a present sentinel.
++			state.resume = true
++		}
+ 	}
+-	placeholders := make([]string, len(auxRekeyPasses))
+-	keys := make([]any, len(auxRekeyPasses))
+-	for i, pass := range auxRekeyPasses {
+-		placeholders[i] = "?"
+-		keys[i] = pass.sentinelKey
++	if err := rows.Err(); err != nil {
++		if isSchemaEncodingDriftErr(err) {
++			return auxRekeyState{}, nil
++		}
++		return auxRekeyState{}, err
+ 	}
+-	var n int
+-	if err := db.QueryRowContext(ctx,
+-		fmt.Sprintf("SELECT COUNT(*) FROM local_metadata WHERE `key` IN (%s)", strings.Join(placeholders, ", ")),
+-		keys...).Scan(&n); err != nil {
+-		return false, err
++	return state, nil
++}
++
++// auxRekeyExemptTables reports which aux tables MigrateUp must drop from its
++// dirtyBefore set before running the re-key: exactly the tables the upcoming
++// rekeyAuxRowIDsAllPasses will rewrite, unioned across every pass.
++//
++// It is deliberately derived from the same per-pass tablesToRekey selection the
++// rewrite itself uses, so the exemption can never be wider than the rewrite.
++// That matters because a post-marker resume re-keys only the recorded drifted
++// subset (bd-578h9 / #4380): exempting all four aux tables there — as a single
++// collapsed "some rewrite is in flight" bit would — drops a non-drifted aux
++// table's pre-existing user edits out of dirtyBefore, and stageSchemaTables
++// then sweeps them into the "schema: apply migrations" commit. Keying the
++// exemption off the exact rewrite set closes that asymmetry by construction.
++func auxRekeyExemptTables(ctx context.Context, db DBConn, mainVersionBefore int) (map[string]bool, error) {
++	pending, err := ignoredSource.pendingVersions(ctx, db)
++	if err != nil {
++		return nil, fmt.Errorf("reading pending ignored migrations: %w", err)
+ 	}
+-	return n > 0, nil
++	exempt := make(map[string]bool)
++	for _, pass := range auxRekeyPasses {
++		state, err := readAuxRekeyState(ctx, db, pass.sentinelKey)
++		if err != nil {
++			return nil, fmt.Errorf("reading aux rekey state: %w", err)
++		}
++		tables, _ := pass.tablesToRekey(mainVersionBefore, pending, state)
++		for _, t := range tables {
++			exempt[t.name] = true
++		}
++	}
++	return exempt, nil
+ }
+ 
+ func setAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string) error {
+@@ -133,6 +247,25 @@ func clearAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string)
+ 	return err
+ }
+ 
++func setAuxRekeyDrifted(ctx context.Context, db DBConn, tables []string) error {
++	// Same on-demand create as the sentinel: local_metadata is dolt-ignored, so
++	// a clone that arrived past 0029 may not have it yet.
++	if _, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS local_metadata (`key` VARCHAR(255) PRIMARY KEY, value TEXT NOT NULL DEFAULT '')"); err != nil {
++		return fmt.Errorf("ensuring local_metadata: %w", err)
++	}
++	_, err := db.ExecContext(ctx,
++		"REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)",
++		auxRowRekeyDriftedKey, strings.Join(tables, ","))
++	return err
++}
++
++func clearAuxRekeyDrifted(ctx context.Context, db DBConn) error {
++	_, err := db.ExecContext(ctx,
++		"DELETE FROM local_metadata WHERE `key` = ?",
++		auxRowRekeyDriftedKey)
++	return err
++}
++
+ // auxRekeyTable describes one table covered by the re-key. columns is the
+ // frozen SELECT list of every non-id column, in creation order, with datetime
+ // columns CAST to CHAR server-side so the scanned text is identical across
+@@ -173,6 +306,21 @@ var auxRekeyTables = []auxRekeyTable{
+ 	},
+ }
+ 
++// auxRekeyTableNames is auxRekeyTables' name set, used by readAuxRekeyState to
++// filter the local_metadata drift record: that cell is a free-form
++// comma-separated string, not validated at write time by anything but this
++// package's own writer, so a stale or corrupted entry must not reach a caller
++// that trusts every name in state.drifted to be one of the four re-keyed
++// tables (schema.go's MigrateUp uses it unfiltered to exempt tables from the
++// pre-existing-dirty guard).
++var auxRekeyTableNames = func() map[string]bool {
++	names := make(map[string]bool, len(auxRekeyTables))
++	for _, t := range auxRekeyTables {
++		names[t.name] = true
++	}
++	return names
++}()
++
+ // rekeyAuxRowIDs converges the primary keys that migration 0037 randomized
+ // (bd-6dnrw.2). 0037 backfilled the CHAR(36) ids of events, comments,
+ // issue_snapshots and compaction_snapshots with per-clone-random UUID()s, so
+@@ -191,6 +339,14 @@ var auxRekeyTables = []auxRekeyTable{
+ // mainVersionBefore is the main-source cursor as it stood before this pass's
+ // migrations ran; at or past auxRowRekeyShippedMainVersion the rewrite is
+ // skipped (see that constant).
++//
++// A table whose storage carries dolthub/dolt#11131 encoding drift cannot be
++// scanned at all, so it is skipped and recorded (auxRowRekeyDriftedKey) rather
++// than failing the pass; a later pass re-keys just that table, and succeeds
++// once the drift is repaired. Like the crash-resume path it re-keys the whole
++// table, including rows minted since the skip, so the sooner the retry lands
++// the fewer of those there are — which is why it is re-attempted on every
++// subsequent migration pass rather than waiting to be asked.
+ func rekeyAuxRowIDs(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass) (bool, error) {
+ 	pending, err := ignoredSource.pendingVersions(ctx, db)
+ 	if err != nil {
+@@ -217,26 +373,72 @@ func rekeyAuxRowIDsAllPasses(ctx context.Context, db DBConn, mainVersionBefore i
+ 	return wrote, nil
+ }
+ 
+-func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass, pending []int) (bool, error) {
+-	markerPending := false
+-	for _, v := range pending {
+-		if v == pass.markerVersion {
+-			markerPending = true
+-			break
+-		}
++// tablesToRekey reports which aux tables this pass rewrites on the current
++// MigrateUp, and whether it runs at all. It is the single source of truth for
++// that selection: rekeyAuxRowIDsPending drives its own rewrite from it, and
++// MigrateUp's dirtyBefore exemption (auxRekeyExemptTables) unions it across
++// passes — so the set of tables exempted from the pre-existing-dirty guards can
++// never diverge from the set the rewrite actually touches (#4380).
++//
++// runs is false only when neither gate admits the pass. It stays true for a
++// post-marker resume whose table set is empty — a sentinel left set after the
++// drift record was already cleared — so the caller still proceeds to clear that
++// stale sentinel instead of leaking it.
++func (pass auxRekeyPass) tablesToRekey(mainVersionBefore int, pending []int, state auxRekeyState) ([]auxRekeyTable, bool) {
++	markerPending := slices.Contains(pending, pass.markerVersion)
++
++	// The marker gate is "once per clone" only for a pass that actually
++	// converged every table. A pass that skipped one for #11131 drift completed
++	// — so the marker was recorded in that same MigrateUp — and the marker alone
++	// would then bar re-entry forever, making the skip permanent. A crash
++	// sentinel or a drift record (state.pending()) re-admits the pass so it can
++	// finish once the storage is repaired.
++	if !markerPending && !state.pending() {
++		return nil, false
+ 	}
+-	if !markerPending {
+-		return false, nil
++	// The fresh-clone skip (record the marker, skip the rewrite — bd-578h9.4)
++	// must not fire on a lineage whose previous pass crashed mid-rekey: that
++	// pass already advanced the main cursor past the shipped version, but its
++	// sentinel — or a recorded drift skip — proves the rewrite never finished
++	// (bd-578h9.16).
++	if mainVersionBefore >= pass.shippedMainVersion && !state.pending() {
++		return nil, false
++	}
++
++	// A markerPending pass is the one-time convergence and covers all four
++	// tables. Once the marker is recorded, MigrateUp records it
++	// (ignoredSource.migrate) only after the rewrite returns without error, so a
++	// clone that still owes work past that point owes it for exactly the tables
++	// the drift record names. Re-keying any other table there would be wrong —
++	// those converged in the completed pass, and rows minted since carry
++	// app-minted ids already consistent across clones, so rewriting them on this
++	// clone alone manufactures the divergence the re-key exists to remove. This
++	// also covers a drift-resume pass that itself died on an unrelated error and
++	// left the sentinel set: still a post-marker pass, so still only the
++	// recorded tables.
++	if markerPending {
++		return auxRekeyTables, true
+ 	}
+-	resume, err := auxRekeyResumePending(ctx, db, pass.sentinelKey)
++	// This is a selection, not a validation filter: state.drifted is already
++	// guaranteed a subset of auxRekeyTables' names (readAuxRekeyState filters
++	// it), so slices.Contains here is what maps those names to the full
++	// auxRekeyTable structs (with their frozen columns) this pass actually needs.
++	var tables []auxRekeyTable
++	for _, t := range auxRekeyTables {
++		if slices.Contains(state.drifted, t.name) {
++			tables = append(tables, t)
++		}
++	}
++	return tables, true
++}
++
++func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass, pending []int) (bool, error) {
++	state, err := readAuxRekeyState(ctx, db, pass.sentinelKey)
+ 	if err != nil {
+-		return false, fmt.Errorf("reading aux rekey sentinel: %w", err)
++		return false, fmt.Errorf("reading aux rekey state: %w", err)
+ 	}
+-	// The fresh-clone skip must not fire on a lineage whose previous pass
+-	// crashed mid-rekey: that pass already advanced the main cursor past the
+-	// shipped version, but its sentinel proves the rewrite never finished
+-	// (bd-578h9.16).
+-	if mainVersionBefore >= pass.shippedMainVersion && !resume {
++	tables, runs := pass.tablesToRekey(mainVersionBefore, pending, state)
++	if !runs {
+ 		return false, nil
+ 	}
+ 
+@@ -248,19 +450,103 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
+ 	}
+ 
+ 	wrote := false
+-	for _, t := range auxRekeyTables {
++	var skipped []string
++	for _, t := range tables {
+ 		w, err := rekeyAuxRowTable(ctx, db, t)
+ 		wrote = wrote || w
+ 		if err != nil {
++			// #4380: a table carrying dolthub/dolt#11131 schema-encoding drift
++			// cannot be re-keyed at all — every read of an affected cell panics
++			// server-side, and no SQL write can repair or remove the row. Before
++			// this, that aborted the whole MigrateUp pass, which also made the
++			// database unopenable by any rekey-aware binary: the migration is
++			// re-attempted on open, so the panic recurred on every start and the
++			// only build that could read the data was the pre-re-key one. Skip
++			// the table loudly and let the rest of the pass complete instead.
++			if isSchemaEncodingDriftErr(err) {
++				skipped = append(skipped, t.name)
++				// log, not the TTY-gated progress writer: a piped or CI caller
++				// discards that writer, and these three lines are the only
++				// notice that a table's ids stayed divergent.
++				log.Printf("schema migration: aux row id re-key skipped %q — the table holds rows Dolt cannot decode (schema-encoding drift, gastownhall/beads#4380): %v",
++					t.name, err)
++				continue
++			}
+ 			return wrote, fmt.Errorf("%s: %w", t.name, err)
+ 		}
+ 	}
++	// The tables this pass covered are exactly the ones the record should now
++	// name: a full pass covered all four, a post-marker pass covered precisely
++	// the previously-recorded ones, so in both cases what is still skipped is
++	// what failed just now.
++	switch {
++	case len(skipped) > 0:
++		if err := setAuxRekeyDrifted(ctx, db, skipped); err != nil {
++			return wrote, fmt.Errorf("recording aux rekey drift: %w", err)
++		}
++		log.Printf("schema migration: %d table(s) kept their old row ids: %s — merges with other clones of this database may duplicate those rows",
++			len(skipped), strings.Join(skipped, ", "))
++		log.Printf("schema migration: repair the storage drift (see gastownhall/beads#4380); the re-key is re-attempted on each later pass that applies schema migrations")
++	case len(state.drifted) > 0:
++		if err := clearAuxRekeyDrifted(ctx, db); err != nil {
++			return wrote, fmt.Errorf("clearing aux rekey drift record: %w", err)
++		}
++		// Names what this pass actually covered, which is the recorded set
++		// minus any entry no longer in auxRekeyTables — a stale name is dropped
++		// by clearing the record, not by claiming it converged.
++		if len(tables) > 0 {
++			covered := make([]string, 0, len(tables))
++			for _, t := range tables {
++				covered = append(covered, t.name)
++			}
++			log.Printf("schema migration: aux row id re-key completed for previously skipped table(s): %s",
++				strings.Join(covered, ", "))
++		}
++	}
+ 	if err := clearAuxRekeyInProgress(ctx, db, pass.sentinelKey); err != nil {
+ 		return wrote, fmt.Errorf("clearing aux rekey sentinel: %w", err)
+ 	}
+ 	return wrote, nil
+ }
+ 
++// isSchemaEncodingDriftErr reports whether err carries the dolthub/dolt#11131
++// schema-encoding-drift signature: a TEXT/LONGTEXT column whose on-disk
++// storage-encoding tag was re-derived without rewriting rows, so decoding a
++// cell reads an address of the wrong width and panics inside the storage
++// engine. The engine recovers it per query and surfaces
++// "Error 1105 (HY000): panic recovered: invalid hash length: 19". Only this
++// class is tolerated by the re-key; every other failure still aborts the pass.
++//
++// Deliberately matched on the bare hash-length phrase, not on ": 19" and not
++// on the "panic recovered" wrapper:
++//
++//   - the width varies with the direction of the tag flip — migration 0057
++//     documents this same drift from bd's own side (0048 re-widening an
++//     already-LONGTEXT column under a pre-#11126 embedded engine) and records
++//     both "invalid hash length: 19" on read and "invalid hash length: 1" on
++//     insert/merge;
++//   - the wrapper is added by the SQL engine, so a path that surfaced the
++//     panic unwrapped would fall through to the abort that leaves affected
++//     databases unopenable — the failure this whole change exists to end.
++//
++// The cost of the wider match is bounded: a non-#11131 "invalid hash length"
++// (dolt raises it from hash.New generally) means storage this re-key cannot
++// read either, so skipping the table and recording it is the same correct
++// answer. The pass still aborts on every error that does not carry the phrase.
++//
++// What it cannot catch: the same drift also produces cells that decode to
++// garbage instead of panicking (#4380 reports ~10% of affected cells returning
++// a zero payload). Those scan without error, so their rows are re-keyed from
++// corrupt content and converge to an id no healthy clone derives. Nothing here
++// can detect that — it is a reason the storage repair is still required, not a
++// reason to widen the match further.
++func isSchemaEncodingDriftErr(err error) bool {
++	if err == nil {
++		return false
++	}
++	return strings.Contains(strings.ToLower(err.Error()), "invalid hash length")
++}
++
+ // rekeyAuxRowTable re-derives the ids of one table. The whole table is grouped
+ // by content digest; each digest's rows take the deterministic ids for
+ // ordinals 0..n-1. A row already holding one of its group's target ids keeps
+diff --git a/internal/storage/schema/aux_row_id_backfill_test.go b/internal/storage/schema/aux_row_id_backfill_test.go
+index 84ac7549e..7f6de318d 100644
+--- a/internal/storage/schema/aux_row_id_backfill_test.go
++++ b/internal/storage/schema/aux_row_id_backfill_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"database/sql"
+ 	"errors"
+ 	"regexp"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/DATA-DOG/go-sqlmock"
+@@ -190,8 +191,9 @@ func TestRekeyAuxRowTableSkipsMissingTable(t *testing.T) {
+ }
+ 
+ // TestRekeyAuxRowIDsSkipsWhenMarkerRecorded verifies the clone-local gate: once
+-// the ignored marker migration is recorded, the re-key never scans a table
+-// again, so steady-state opens do not churn synced rows.
++// the ignored marker migration is recorded and the pass that recorded it left
++// no sentinel behind, the re-key never scans a table again, so steady-state
++// opens do not churn synced rows.
+ func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
+ 	db, mock, err := sqlmock.New()
+ 	if err != nil {
+@@ -203,6 +205,7 @@ func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion)
+ 	expectIgnoredSentinelProbes(mock, true)
++	expectAuxRekeyState(mock, false)
+ 	// No further expectations: no table may be probed or scanned.
+ 
+ 	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
+@@ -230,7 +233,7 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion-1)
+ 	expectIgnoredSentinelProbes(mock, true)
+-	expectAuxRekeySentinel(mock, false)
++	expectAuxRekeyState(mock, false)
+ 	expectSetAuxRekeySentinel(mock)
+ 	// Each of the four tables is probed; this mocked world has none of them,
+ 	// so each probe returns 0 and the loop completes without scanning.
+@@ -251,18 +254,37 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
+ 	}
+ }
+ 
+-// expectAuxRekeySentinel mocks auxRekeyResumePending: the local_metadata
+-// table-existence probe, then (when the table exists) the sentinel-row count.
+-func expectAuxRekeySentinel(mock sqlmock.Sqlmock, pending bool) {
++// expectAuxRekeyState mocks readAuxRekeyState for the initial pass: the
++// local_metadata table-existence probe, then (when the table exists) the one
++// row-read that returns both the pass's in-flight sentinel and the #4380
++// drift record.
++func expectAuxRekeyState(mock sqlmock.Sqlmock, resume bool, drifted ...string) {
+ 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+ 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+-	n := 0
+-	if pending {
+-		n = 1
++	rows := sqlmock.NewRows([]string{"key", "value"})
++	if resume {
++		rows.AddRow(auxRekeyPassInitial.sentinelKey, "1")
+ 	}
+-	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+-		WithArgs(auxRekeyPassInitial.sentinelKey).
+-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
++	if len(drifted) > 0 {
++		rows.AddRow(auxRowRekeyDriftedKey, strings.Join(drifted, ","))
++	}
++	mock.ExpectQuery(regexp.QuoteMeta("SELECT `key`, value FROM local_metadata WHERE `key` IN (?, ?)")).
++		WithArgs(auxRekeyPassInitial.sentinelKey, auxRowRekeyDriftedKey).
++		WillReturnRows(rows)
++}
++
++func expectSetAuxRekeyDrifted(mock sqlmock.Sqlmock, tables ...string) {
++	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
++		WillReturnResult(sqlmock.NewResult(0, 0))
++	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)")).
++		WithArgs(auxRowRekeyDriftedKey, strings.Join(tables, ",")).
++		WillReturnResult(sqlmock.NewResult(0, 1))
++}
++
++func expectClearAuxRekeyDrifted(mock sqlmock.Sqlmock) {
++	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
++		WithArgs(auxRowRekeyDriftedKey).
++		WillReturnResult(sqlmock.NewResult(0, 1))
+ }
+ 
+ func expectSetAuxRekeySentinel(mock sqlmock.Sqlmock) {
+@@ -281,6 +303,43 @@ func expectClearAuxRekeySentinel(mock sqlmock.Sqlmock) {
+ 		WillReturnResult(sqlmock.NewResult(0, 1))
+ }
+ 
++// expectAuxRekeyStateForPass is expectAuxRekeyState generalized to name the
++// pass explicitly, for tests that exercise more than auxRekeyPassInitial
++// (e.g. rekeyAuxRowIDsAllPasses, which runs every pass in auxRekeyPasses off
++// the same shared drift record — see auxRowRekeyDriftedKey).
++func expectAuxRekeyStateForPass(mock sqlmock.Sqlmock, pass auxRekeyPass, resume bool, drifted ...string) {
++	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
++	rows := sqlmock.NewRows([]string{"key", "value"})
++	if resume {
++		rows.AddRow(pass.sentinelKey, "1")
++	}
++	if len(drifted) > 0 {
++		rows.AddRow(auxRowRekeyDriftedKey, strings.Join(drifted, ","))
++	}
++	mock.ExpectQuery(regexp.QuoteMeta("SELECT `key`, value FROM local_metadata WHERE `key` IN (?, ?)")).
++		WithArgs(pass.sentinelKey, auxRowRekeyDriftedKey).
++		WillReturnRows(rows)
++}
++
++// expectSetAuxRekeySentinelForPass is expectSetAuxRekeySentinel generalized to
++// name the pass explicitly; see expectAuxRekeyStateForPass.
++func expectSetAuxRekeySentinelForPass(mock sqlmock.Sqlmock, pass auxRekeyPass) {
++	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
++		WillReturnResult(sqlmock.NewResult(0, 0))
++	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, '1')")).
++		WithArgs(pass.sentinelKey).
++		WillReturnResult(sqlmock.NewResult(0, 1))
++}
++
++// expectClearAuxRekeySentinelForPass is expectClearAuxRekeySentinel
++// generalized to name the pass explicitly; see expectAuxRekeyStateForPass.
++func expectClearAuxRekeySentinelForPass(mock sqlmock.Sqlmock, pass auxRekeyPass) {
++	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
++		WithArgs(pass.sentinelKey).
++		WillReturnResult(sqlmock.NewResult(0, 1))
++}
++
+ // TestRekeyAuxRowIDsSkipsConvergedLineage verifies the bd-578h9.4 gate: when
+ // the main cursor already reached the version that shipped with the re-key
+ // BEFORE this pass ran, the lineage was migrated by a rekey-aware binary and
+@@ -297,7 +356,7 @@ func TestRekeyAuxRowIDsSkipsConvergedLineage(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion-1)
+ 	expectIgnoredSentinelProbes(mock, true)
+-	expectAuxRekeySentinel(mock, false)
++	expectAuxRekeyState(mock, false)
+ 	// No further expectations: marker is pending, but the pre-pass main
+ 	// cursor at the watershed and no crash sentinel means no table may be
+ 	// probed or scanned.
+@@ -331,7 +390,7 @@ func TestRekeyAuxRowIDsResumesAfterCrash(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion-1)
+ 	expectIgnoredSentinelProbes(mock, true)
+-	expectAuxRekeySentinel(mock, true)
++	expectAuxRekeyState(mock, true)
+ 	expectSetAuxRekeySentinel(mock)
+ 	for range auxRekeyTables {
+ 		expectColumnExists(mock, false)
+@@ -362,7 +421,7 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+ 		"version", auxRekeyPassInitial.markerVersion-1)
+ 	expectIgnoredSentinelProbes(mock, true)
+-	expectAuxRekeySentinel(mock, false)
++	expectAuxRekeyState(mock, false)
+ 	expectSetAuxRekeySentinel(mock)
+ 	// First table probe fails; no DELETE of the sentinel may follow.
+ 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
+@@ -375,3 +434,59 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
+ 		t.Fatalf("unmet sql expectations: %v", err)
+ 	}
+ }
++
++// TestRekeyAuxRowIDsAllPassesSharesDriftRecordAcrossPasses verifies the
++// auxRowRekeyDriftedKey/auxRekeyPasses invariant documented on those two
++// declarations: every pass runs the identical rewrite over the identical
++// auxRekeyTables set, so one shared drift record is enough — whichever pass
++// retries a skipped table first does the work, and clearing the record
++// correctly makes every later pass's own retry a no-op.
++//
++// Here both passes' markers are already recorded (steady state, not a fresh
++// clone) and the shared record still names "events" as skipped. Pass 1
++// (auxRekeyPassInitial, first in auxRekeyPasses) must be the one that reads
++// the record as pending and retries exactly that table, then clears it. Pass
++// 2 (auxRekeyPassDerivedInsert) must then see nothing pending in its own
++// state read and stop there — it must not re-probe or re-scan the table pass
++// 1 already resolved.
++func TestRekeyAuxRowIDsAllPassesSharesDriftRecordAcrossPasses(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++	captureLog(t)
++
++	// Both passes' markers already recorded: the ignored cursor is at or past
++	// the later pass's markerVersion, so rekeyAuxRowIDsAllPasses' single
++	// pendingVersions read reports neither markerVersion as pending.
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassDerivedInsert.markerVersion)
++	expectIgnoredSentinelProbes(mock, true)
++
++	// Pass 1: its own state read finds the shared drift record naming
++	// "events", so it retries just that table (the other three auxRekeyTables
++	// are left alone — a second table probe here would be an unmet
++	// expectation) and clears the record.
++	expectAuxRekeyStateForPass(mock, auxRekeyPassInitial, false, "events")
++	expectSetAuxRekeySentinelForPass(mock, auxRekeyPassInitial)
++	expectColumnExists(mock, false)
++	expectClearAuxRekeyDrifted(mock)
++	expectClearAuxRekeySentinelForPass(mock, auxRekeyPassInitial)
++
++	// Pass 2: reads its own state after the record is cleared — nothing
++	// pending, so it stops after this probe with no further queries.
++	expectAuxRekeyStateForPass(mock, auxRekeyPassDerivedInsert, false)
++
++	wrote, err := rekeyAuxRowIDsAllPasses(context.Background(), db, auxRekeyPassDerivedInsert.shippedMainVersion)
++	if err != nil {
++		t.Fatalf("rekeyAuxRowIDsAllPasses: %v", err)
++	}
++	if wrote {
++		t.Error("expected wrote=false: the resumed table had nothing left to re-key")
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
+diff --git a/internal/storage/schema/aux_row_id_drift_test.go b/internal/storage/schema/aux_row_id_drift_test.go
+new file mode 100644
+index 000000000..10be8fe45
+--- /dev/null
++++ b/internal/storage/schema/aux_row_id_drift_test.go
+@@ -0,0 +1,407 @@
++package schema
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"log"
++	"regexp"
++	"slices"
++	"strings"
++	"testing"
++
++	"github.com/DATA-DOG/go-sqlmock"
++)
++
++var eventsTable = auxRekeyTables[0]
++
++// driftErr is the error a drifted table returns: dolt recovers the decode panic
++// per query and surfaces it as a 1105.
++var driftErr = errors.New("Error 1105 (HY000): panic recovered: invalid hash length: 19")
++
++func expectEventsSelect(mock sqlmock.Sqlmock) *sqlmock.ExpectedQuery {
++	return mock.ExpectQuery(regexp.QuoteMeta(
++		fmt.Sprintf("SELECT id, %s FROM %s", eventsTable.columns, eventsTable.name)))
++}
++
++// captureLog redirects the standard logger, which is where the drift notices
++// go: the package's own stderr writer is TTY-gated to io.Discard, and these are
++// data-integrity warnings that a piped or CI caller must still see.
++func captureLog(t *testing.T) *bytes.Buffer {
++	t.Helper()
++	var buf bytes.Buffer
++	origOut, origFlags := log.Writer(), log.Flags()
++	log.SetOutput(&buf)
++	log.SetFlags(0)
++	t.Cleanup(func() { log.SetOutput(origOut); log.SetFlags(origFlags) })
++	return &buf
++}
++
++// The re-key tolerates exactly the dolthub/dolt#11131 schema-encoding-drift
++// signature and nothing else: every other failure must still abort the pass.
++func TestIsSchemaEncodingDriftErr(t *testing.T) {
++	cases := []struct {
++		name string
++		err  error
++		want bool
++	}{
++		{"nil", nil, false},
++		{"server 1105 drift panic", driftErr, true},
++		{
++			"wrapped drift panic",
++			fmt.Errorf("scan rows of events: %w", driftErr),
++			true,
++		},
++		{
++			// Migration 0057 records this width for the opposite tag flip.
++			"insert/merge side of the flip",
++			errors.New("Error 1105 (HY000): panic recovered: invalid hash length: 1"),
++			true,
++		},
++		{
++			"unwrapped panic text",
++			errors.New("panic: invalid hash length: 19"),
++			true,
++		},
++		{"plain sql error", errors.New("Error 1062 (23000): duplicate entry"), false},
++		{"connection drop", errors.New("invalid connection"), false},
++		{"unrelated panic", errors.New("Error 1105 (HY000): panic recovered: index out of range"), false},
++		{"lock timeout", errors.New("Error 1205 (HY000): lock wait timeout exceeded"), false},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			if got := isSchemaEncodingDriftErr(c.err); got != c.want {
++				t.Fatalf("isSchemaEncodingDriftErr(%v) = %v, want %v", c.err, got, c.want)
++			}
++		})
++	}
++}
++
++// TestRekeyAuxRowIDsSkipsDriftedTable covers the #4380 unblock: a table whose
++// rows Dolt cannot decode is skipped so the rest of the migration pass
++// completes, instead of aborting it — which left affected databases unopenable,
++// because the pass is re-attempted on every open. The skipped table is recorded
++// so a later pass can finish the job, and the in-progress sentinel is cleared
++// like any completed pass: it means "a rewrite is in flight", and MigrateUp
++// relaxes its dirty-table guards while it is set.
++func TestRekeyAuxRowIDsSkipsDriftedTable(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++	logged := captureLog(t)
++
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassInitial.markerVersion-1)
++	expectIgnoredSentinelProbes(mock, true)
++	expectAuxRekeyState(mock, false)
++	expectSetAuxRekeySentinel(mock)
++	// events carries the drift: its scan panics server-side.
++	expectColumnExists(mock, true)
++	expectEventsSelect(mock).WillReturnError(driftErr)
++	// The remaining three tables still run.
++	for range auxRekeyTables[1:] {
++		expectColumnExists(mock, false)
++	}
++	expectSetAuxRekeyDrifted(mock, "events")
++	expectClearAuxRekeySentinel(mock)
++
++	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial); err != nil {
++		t.Fatalf("drift must not abort the pass: %v", err)
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++	if got := logged.String(); !strings.Contains(got, `skipped "events"`) ||
++		!strings.Contains(got, "may duplicate those rows") {
++		t.Errorf("log = %q\nwant a skip warning naming events and its merge consequence", got)
++	}
++}
++
++// TestRekeyAuxRowIDsSkipsDriftDuringRewrite covers the other half of the drift
++// surface: #4380 reports that UPDATE of an affected row panics just like a read,
++// so the drift can land mid-rewrite, after some ids have already changed. The
++// half-re-keyed table must be recorded and committed rather than failing the
++// pass — it stays resumable because a row already holding one of its group's
++// target ids keeps it, so a later attempt never swaps ids within a group.
++func TestRekeyAuxRowIDsSkipsDriftDuringRewrite(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++	captureLog(t)
++
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassInitial.markerVersion-1)
++	expectIgnoredSentinelProbes(mock, true)
++	expectAuxRekeyState(mock, false)
++	expectSetAuxRekeySentinel(mock)
++	expectColumnExists(mock, true)
++	// The scan succeeds — these are the readable-but-drifted rows — and the
++	// rewrite panics instead.
++	expectEventsSelect(mock).
++		WillReturnRows(sqlmock.NewRows([]string{
++			"id", "issue_id", "event_type", "actor", "old_value", "new_value", "comment", "created_at",
++		}).AddRow("random-a", "bd-1", "status", "steve", "open", "closed", "", "2026-06-09 12:00:00"))
++	mock.ExpectExec(regexp.QuoteMeta("UPDATE events SET id = ? WHERE id = ?")).
++		WithArgs(sqlmock.AnyArg(), "random-a").
++		WillReturnError(driftErr)
++	for range auxRekeyTables[1:] {
++		expectColumnExists(mock, false)
++	}
++	expectSetAuxRekeyDrifted(mock, "events")
++	expectClearAuxRekeySentinel(mock)
++
++	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
++	if err != nil {
++		t.Fatalf("drift mid-rewrite must not abort the pass: %v", err)
++	}
++	if !wrote {
++		t.Error("expected wrote=true so MigrateUp commits the partially re-keyed table")
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
++
++// TestRekeyAuxRowIDsAbortsOnNonDriftError: the tolerance is narrow. An ordinary
++// table failure must still propagate and keep the sentinel, exactly as before
++// #4380 — otherwise it would swallow real migration bugs.
++func TestRekeyAuxRowIDsAbortsOnNonDriftError(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++	captureLog(t)
++
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassInitial.markerVersion-1)
++	expectIgnoredSentinelProbes(mock, true)
++	expectAuxRekeyState(mock, false)
++	expectSetAuxRekeySentinel(mock)
++	expectColumnExists(mock, true)
++	expectEventsSelect(mock).WillReturnError(errors.New("Error 1062 (23000): duplicate entry"))
++
++	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial); err == nil {
++		t.Fatal("expected a non-drift table failure to propagate")
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
++
++// TestRekeyAuxRowIDsResumesDriftedTableOnly is the counterpart to the skip. The
++// pass that skipped completed, so MigrateUp recorded the clone-local marker and
++// the marker gate can no longer re-admit the re-key; the drift record must, or
++// the skipped table would keep its 0037 per-clone-random ids forever, even
++// after the storage drift is repaired.
++//
++// It must also re-key ONLY the recorded table: the other three converged in the
++// first pass, and rows minted since then carry app-minted ids that are already
++// consistent across clones — re-keying those here would manufacture the
++// divergence the whole pass exists to remove.
++func TestRekeyAuxRowIDsResumesDriftedTableOnly(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++	captureLog(t)
++
++	// Marker recorded, no crash sentinel — the post-skip steady state.
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassInitial.markerVersion)
++	expectIgnoredSentinelProbes(mock, true)
++	expectAuxRekeyState(mock, false, "events")
++	expectSetAuxRekeySentinel(mock)
++	// Exactly one table probe: any second one is an unexpected call, which is
++	// what proves the other three are left alone.
++	expectColumnExists(mock, false)
++	expectClearAuxRekeyDrifted(mock)
++	expectClearAuxRekeySentinel(mock)
++
++	// Pre-pass cursor past the watershed too, so the drift record is overriding
++	// both the marker gate and the fresh-clone gate.
++	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial)
++	if err != nil {
++		t.Fatalf("rekeyAuxRowIDs: %v", err)
++	}
++	if wrote {
++		t.Error("expected wrote=false when the resumed table has nothing to re-key")
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
++
++// TestRekeyAuxRowIDsResumeStaysScopedAfterCrash: a drift-resume pass sets the
++// in-flight sentinel like any other, so an unrelated failure (Ctrl-C, lock
++// timeout, dropped connection) can leave the sentinel set on a clone whose
++// marker is already recorded. That state must NOT be read as the bd-578h9.16
++// crash-resume and widened back to all four tables: the other three converged
++// in the completed pass, and re-keying rows minted since — on this clone alone —
++// is exactly the cross-clone divergence the scoping exists to prevent.
++func TestRekeyAuxRowIDsResumeStaysScopedAfterCrash(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++	captureLog(t)
++
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassInitial.markerVersion)
++	expectIgnoredSentinelProbes(mock, true)
++	// Marker recorded AND sentinel set: a drift-resume that died partway.
++	expectAuxRekeyState(mock, true, "events")
++	expectSetAuxRekeySentinel(mock)
++	expectColumnExists(mock, false)
++	expectClearAuxRekeyDrifted(mock)
++	expectClearAuxRekeySentinel(mock)
++
++	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial); err != nil {
++		t.Fatalf("rekeyAuxRowIDs: %v", err)
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
++
++// TestAuxRekeyExemptTablesScopedToRewrittenTables pins the #4380 dirtyBefore
++// fix at its source: MigrateUp drops exactly auxRekeyExemptTables' set from the
++// pre-existing-dirty guard before the re-key runs, so a table that is exempt is
++// a table whose uncommitted user edits stageSchemaTables is then free to sweep
++// into the "schema: apply migrations" commit. The exemption must therefore never
++// name a table the re-key will not itself rewrite.
++//
++// The regression is the post-marker resume: a drift retry whose crash left the
++// in-flight sentinel set, with the drift record naming only a subset. The old
++// collapsed "some rewrite is in flight" bit exempted all four aux tables there;
++// a non-drifted table (comments, say) then lost its dirty protection while the
++// rewrite touched only events, carrying the user's comments edits into the
++// migration commit. Asserting the exempt set equals the drifted subset — and, on
++// a converged database, is empty — is asserting those non-drifted tables stay in
++// dirtyBefore and so never reach the commit.
++func TestAuxRekeyExemptTablesScopedToRewrittenTables(t *testing.T) {
++	allFour := []string{"comments", "compaction_snapshots", "events", "issue_snapshots"}
++	cases := []struct {
++		name              string
++		mainVersionBefore int
++		setup             func(sqlmock.Sqlmock)
++		want              []string
++	}{
++		{
++			// The bug's exact state: marker already recorded (nothing ignored
++			// pending), a drift record for events alone, and pass initial's
++			// crash sentinel still set. Exemption must be {events}, not all four.
++			name:              "post-marker resume with crashed sentinel exempts only the drifted subset",
++			mainVersionBefore: auxRekeyPassDerivedInsert.shippedMainVersion,
++			setup: func(mock sqlmock.Sqlmock) {
++				expectCursorProbe(mock, "ignored_schema_migrations", true)
++				expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++					"version", LatestIgnoredVersion())
++				expectIgnoredSentinelProbes(mock, true)
++				// Pass initial died mid-resume (sentinel set); the shared drift
++				// record names events, so pass derived-insert reads it too.
++				expectAuxRekeyStateForPass(mock, auxRekeyPassInitial, true, "events")
++				expectAuxRekeyStateForPass(mock, auxRekeyPassDerivedInsert, false, "events")
++			},
++			want: []string{"events"},
++		},
++		{
++			// A markerPending pass is the one-time convergence and legitimately
++			// rewrites — and so exempts — all four.
++			name:              "marker-pending first pass exempts all four",
++			mainVersionBefore: auxRekeyPassInitial.shippedMainVersion - 1,
++			setup: func(mock sqlmock.Sqlmock) {
++				expectCursorProbe(mock, "ignored_schema_migrations", true)
++				expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++					"version", auxRekeyPassInitial.markerVersion-1)
++				expectIgnoredSentinelProbes(mock, true)
++				expectAuxRekeyStateForPass(mock, auxRekeyPassInitial, false)
++				expectAuxRekeyStateForPass(mock, auxRekeyPassDerivedInsert, false)
++			},
++			want: allFour,
++		},
++		{
++			// Converged and current, nothing owed: no exemption at all, so a
++			// dirty aux table is fully protected on a healthy database.
++			name:              "converged database exempts nothing",
++			mainVersionBefore: auxRekeyPassDerivedInsert.shippedMainVersion,
++			setup: func(mock sqlmock.Sqlmock) {
++				expectCursorProbe(mock, "ignored_schema_migrations", true)
++				expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++					"version", LatestIgnoredVersion())
++				expectIgnoredSentinelProbes(mock, true)
++				expectAuxRekeyStateForPass(mock, auxRekeyPassInitial, false)
++				expectAuxRekeyStateForPass(mock, auxRekeyPassDerivedInsert, false)
++			},
++			want: nil,
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			db, mock, err := sqlmock.New()
++			if err != nil {
++				t.Fatalf("sqlmock.New: %v", err)
++			}
++			defer db.Close()
++			tc.setup(mock)
++
++			exempt, err := auxRekeyExemptTables(context.Background(), db, tc.mainVersionBefore)
++			if err != nil {
++				t.Fatalf("auxRekeyExemptTables: %v", err)
++			}
++			got := make([]string, 0, len(exempt))
++			for name := range exempt {
++				got = append(got, name)
++			}
++			slices.Sort(got)
++			if !slices.Equal(got, tc.want) {
++				t.Fatalf("exempt = %v, want %v", got, tc.want)
++			}
++			if err := mock.ExpectationsWereMet(); err != nil {
++				t.Fatalf("unmet sql expectations: %v", err)
++			}
++		})
++	}
++}
++
++// TestRekeyAuxRowIDsKeepsDriftRecordWhileUnrepaired: a resumed pass that finds
++// the storage still drifted must re-record the table rather than lose it, so
++// the retry survives arbitrarily many passes before the repair happens.
++func TestRekeyAuxRowIDsKeepsDriftRecordWhileUnrepaired(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++	captureLog(t)
++
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassInitial.markerVersion)
++	expectIgnoredSentinelProbes(mock, true)
++	expectAuxRekeyState(mock, false, "events")
++	expectSetAuxRekeySentinel(mock)
++	expectColumnExists(mock, true)
++	expectEventsSelect(mock).WillReturnError(driftErr)
++	expectSetAuxRekeyDrifted(mock, "events")
++	expectClearAuxRekeySentinel(mock)
++
++	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial); err != nil {
++		t.Fatalf("rekeyAuxRowIDs: %v", err)
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
+diff --git a/internal/storage/schema/lock_test.go b/internal/storage/schema/lock_test.go
+index 5209578cb..c2bcfc122 100644
+--- a/internal/storage/schema/lock_test.go
++++ b/internal/storage/schema/lock_test.go
+@@ -371,14 +371,23 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
+ 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
+ 		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
+ 	expectDoltStatusRows(mock)
+-	// MigrateUp probes the aux-rekey crash sentinel (bd-578h9.16); this
+-	// mocked world has no local_metadata table, so no crashed pass.
+-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+-	// MigrateUp captures the pre-pass main cursor for the aux re-key
+-	// watershed (bd-578h9.4) before the main migrations run.
++	// MigrateUp captures the pre-pass main cursor for the aux re-key watershed
++	// (bd-578h9.4) before the main migrations run — read up front now because the
++	// dirtyBefore exemption below is derived from it.
+ 	expectCursorProbe(mock, "schema_migrations", true)
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
++	// auxRekeyExemptTables scopes the aux-table dirtyBefore exemption to exactly
++	// the tables the upcoming re-key rewrites: it reads the ignored cursor to see
++	// which passes' markers are pending, then each pass's clone-local state. This
++	// mocked world has no local_metadata table, so each per-pass read stops at
++	// the existence probe and nothing is exempted.
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
++	expectIgnoredSentinelProbes(mock, true)
++	for range auxRekeyPasses {
++		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	}
+ 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS schema_migrations").
+ 		WillReturnResult(sqlmock.NewResult(0, 0))
+ 	expectContentHashColumnExists(mock)
+@@ -424,11 +433,19 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
+ 	// no-ops without scanning/updating rows.
+ 	expectColumnExists(mock, false)
+ 	expectColumnExists(mock, false)
+-	// rekeyAuxRowIDs reads the ignored cursor to see whether its clone-local
+-	// marker is pending; at latest it is not, so the re-key no-ops.
++	// rekeyAuxRowIDsAllPasses reads the ignored cursor to see whether any
++	// pass's clone-local marker is pending; at latest none is. Each pass then
++	// reads the clone-local re-key state — its crash sentinel and the #4380
++	// drift record, either of which would re-admit it; this mocked world has no
++	// local_metadata table, so each read stops at the table-existence probe and
++	// the re-key no-ops.
+ 	expectCursorProbe(mock, "ignored_schema_migrations", true)
+ 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
+ 	expectIgnoredSentinelProbes(mock, true)
++	for range auxRekeyPasses {
++		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	}
+ 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS ignored_schema_migrations").
+ 		WillReturnResult(sqlmock.NewResult(0, 0))
+ 	expectContentHashColumnExists(mock)
+@@ -525,9 +542,20 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
+ 	// Nothing staged -> no unstage exec; seed was a no-op -> no seed commit.
+ 	// committableDirtyTables re-reads dolt_status (ignored tables excluded).
+ 	expectDoltStatusDirtyEvents(mock)
+-	// auxRekeyResumePending: no local_metadata table, no crashed rekey pass.
+-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	// MigrateUp captures the pre-pass main cursor up front now (it drives the
++	// aux-rekey dirtyBefore exemption); the guard refusal is still reached
++	// before the main migrations run.
++	expectCursorProbe(mock, "schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", cursor)
++	// auxRekeyExemptTables: read the ignored cursor, then each pass's clone-local
++	// re-key state. No ignored cursor table and no local_metadata here, so
++	// nothing is exempted — in particular the dirty `events` aux table stays in
++	// dirtyBefore and still trips the pending-0062 guard below.
++	expectCursorProbe(mock, "ignored_schema_migrations", false)
++	for range auxRekeyPasses {
++		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	}
+ 	// pendingMigrationDirtyTables: cursor read, then pending 0062's SQL
+ 	// touches `events` -> DirtyTablesError.
+ 	expectCursorProbe(mock, "schema_migrations", true)
+diff --git a/internal/storage/schema/schema.go b/internal/storage/schema/schema.go
+index 6779c1b7d..6a00edd85 100644
+--- a/internal/storage/schema/schema.go
++++ b/internal/storage/schema/schema.go
+@@ -658,18 +658,42 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+ 		return 0, fmt.Errorf("reading pre-migration status: %w", err)
+ 	}
+ 	delete(dirtyBefore, "dolt_ignore")
++	// Captured before the main migrations run: the aux re-key uses it to
++	// distinguish the lineage's first rekey-aware migration (run the pass) from
++	// a fresh clone of an already-converged lineage (record the marker only,
++	// bd-578h9.4). Read up front because the dirtyBefore exemption just below is
++	// derived from it (auxRekeyExemptTables).
++	mainVersionBefore, err := mainSource.currentVersion(ctx, db)
++	if err != nil {
++		return 0, fmt.Errorf("reading pre-migration schema version: %w", err)
++	}
+ 	// A previous pass that crashed mid-aux-rekey left its partial UPDATEs
+ 	// dirty in the working set with the in-progress sentinel still recorded
+ 	// (bd-578h9.16). Those tables are this pass's own migration state, not
+ 	// pre-existing user writes: dropping them from dirtyBefore exempts them
+ 	// from the changed-signature guard (the resumed rekey is about to change
+ 	// them) and lets stageSchemaTables commit them with the rest of the pass.
+-	if resuming, err := anyAuxRekeyResumePending(ctx, db); err != nil {
+-		return 0, fmt.Errorf("reading aux rekey sentinel: %w", err)
+-	} else if resuming {
+-		for _, t := range auxRekeyTables {
+-			delete(dirtyBefore, t.name)
+-		}
++	//
++	// A table skipped for #11131 encoding drift (#4380) needs the same
++	// exemption on the pass that retries it, and needs it more: the
++	// changed-signature guard below reads dirty tables through dolt_diff, which
++	// decodes exactly the cells that panic — so leaving a drifted table in
++	// dirtyBefore would fail the pass on the read, re-creating the unopenable
++	// database this exemption path exists to rescue.
++	//
++	// auxRekeyExemptTables returns exactly the tables the upcoming
++	// rekeyAuxRowIDsAllPasses will rewrite, computed from the same per-pass
++	// selection the rewrite uses. Scoping the exemption to that set — rather
++	// than blanket-exempting all four aux tables whenever any rewrite is in
++	// flight — keeps a post-marker resume, which touches only the recorded
++	// drifted subset, from dropping a non-drifted aux table's pre-existing user
++	// edits out of dirtyBefore and into the migration commit (#4380).
++	auxRekeyExempt, err := auxRekeyExemptTables(ctx, db, mainVersionBefore)
++	if err != nil {
++		return 0, err
++	}
++	for name := range auxRekeyExempt {
++		delete(dirtyBefore, name)
+ 	}
+ 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
+ 	if err != nil {
+@@ -682,14 +706,6 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+ 	if err != nil {
+ 		return 0, fmt.Errorf("reading pre-migration dirty table diffs: %w", err)
+ 	}
+-	// Captured before the main migrations run: the aux re-key uses it to
+-	// distinguish the lineage's first rekey-aware migration (run the pass)
+-	// from a fresh clone of an already-converged lineage (record the marker
+-	// only, bd-578h9.4).
+-	mainVersionBefore, err := mainSource.currentVersion(ctx, db)
+-	if err != nil {
+-		return 0, fmt.Errorf("reading pre-migration schema version: %w", err)
+-	}
+ 
+ 	applied, mainColumnAdded, err := mainSource.migrate(ctx, db, 0)
+ 	if err != nil {
+@@ -782,6 +798,15 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+ 	return applied, nil
+ }
+ 
++// migrationWorkNeeded deliberately does NOT consult the aux-rekey drift record
++// (auxRowRekeyDriftedKey): the #4380 retry is opportunistic, not eager. A
++// database that is otherwise fully current re-enters the rekey path only on the
++// next pass that has other migration work to do, so a table left divergent by
++// repaired-but-not-yet-reconverged drift converges then rather than on the very
++// next open. This keeps steady-state opens free of a local_metadata probe; the
++// skip log already tells the user convergence is deferred to a later migration
++// pass (see rekeyAuxRowIDsPending). Making a repaired DB re-converge immediately
++// would mean folding that drift record in here — a deliberate non-goal for now.
+ func migrationWorkNeeded(ctx context.Context, db DBConn) (bool, error) {
+ 	if !mainSource.atLatest(ctx, db) || !ignoredSource.atLatest(ctx, db) {
+ 		return true, nil
+diff --git a/internal/storage/schema/schema_test.go b/internal/storage/schema/schema_test.go
+index 7b4aad28d..fc681aac1 100644
+--- a/internal/storage/schema/schema_test.go
++++ b/internal/storage/schema/schema_test.go
+@@ -84,9 +84,20 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T)
+ 	// committableDirtyTables -> dirtyTables(ctx, db, true): same dirty state.
+ 	expectDirtyDoltStatusRow(mock, "dependencies", false)
+ 
+-	// auxRekeyResumePending: no local_metadata table, so no resume in flight.
+-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	// MigrateUp now captures the pre-pass main cursor up front (it drives the
++	// aux-rekey dirtyBefore exemption); v42 (behind latest) is read here.
++	expectCursorProbe(mock, "schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
++	// auxRekeyExemptTables reads the ignored cursor to see which passes' markers
++	// are pending, then each pass's clone-local re-key state. This mocked world
++	// has no ignored cursor table and no local_metadata, so every read stops at
++	// its existence probe and nothing aux is exempted — and `dependencies` is
++	// not an aux table anyway, so it stays in dirtyBefore.
++	expectCursorProbe(mock, "ignored_schema_migrations", false)
++	for range auxRekeyPasses {
++		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
++			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++	}
+ 
+ 	// pendingMigrationDirtyTables re-reads the current version and finds
+ 	// migration 0043 touches the dirty `dependencies` table.

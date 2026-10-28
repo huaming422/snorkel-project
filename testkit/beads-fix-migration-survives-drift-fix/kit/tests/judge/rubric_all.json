@@ -1,0 +1,38 @@
+{
+  "files": [
+    "internal/storage/schema/aux_row_id_backfill.go",
+    "internal/storage/schema/schema.go"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "a_re-key_that_hits_the_dolt_schema-encoding-drift_signature",
+      "description": "A re-key that hits the Dolt schema-encoding-drift signature (`invalid hash length: 19`) on an aux table does NOT abort the migration pass \u2014 the pass completes (and the remaining tables are processed) instead of returning an error."
+    },
+    {
+      "name": "the_drift_tolerance_spans_the_signature's_width_variants_and",
+      "description": "The drift tolerance spans the signature's width variants and an unwrapped panic string but not unrelated recovered panics: `invalid hash length: 19`, `invalid hash length: 1`, and `panic: invalid hash length: 19` are tolerated (pass survives); `panic recovered: index out of range` and ordinary SQL errors are not (pass aborts)."
+    },
+    {
+      "name": "a_table_skipped_for_drift_is_re-keyed_by_a_later_migration_p",
+      "description": "A table skipped for drift is re-keyed by a LATER migration pass even after the clone-local convergence marker is already recorded (the skip must be resumable, not permanent) \u2014 the naive 'clear sentinel, return nil' fix fails this."
+    },
+    {
+      "name": "a_post-marker_drift_resume_re-keys_only_the_previously-recor",
+      "description": "A post-marker drift resume re-keys ONLY the previously-recorded table(s), not all four aux tables (re-keying already-converged tables on one clone manufactures cross-clone divergence)."
+    },
+    {
+      "name": "when_the_re-key_skips_an_undecodable_table,_the_skip_is_surf",
+      "description": "When the re-key skips an undecodable table, the skip is surfaced through a non-discarded channel (standard logger, structured logger, or stderr) rather than only a TTY-gated progress writer or silently \u2014 the only callers who can act on the deferred-convergence consequence (piped/CI/agent) are the ones a progress writer discards."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "a_non-drift_error_during_the_re-key_still_aborts_the_pass_(t",
+      "description": "A NON-drift error during the re-key still aborts the pass (the tolerance is narrow \u2014 real migration failures must not be swallowed)."
+    },
+    {
+      "name": "the_internal/storage/schema_package_still_builds_and_its_exi",
+      "description": "The internal/storage/schema package still builds and its existing unit-test suite passes after the fix (callers of the removed/renamed helpers remain consistent; the preserved invariant 'a non-drift failure keeps the in-progress sentinel' still holds)."
+    }
+  ]
+}

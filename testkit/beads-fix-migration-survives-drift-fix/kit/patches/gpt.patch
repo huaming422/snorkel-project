@@ -1,0 +1,702 @@
+diff --git a/internal/storage/dberrors/errors.go b/internal/storage/dberrors/errors.go
+index 5811a44e..2c79166f 100644
+--- a/internal/storage/dberrors/errors.go
++++ b/internal/storage/dberrors/errors.go
+@@ -113,6 +113,17 @@ func IsAccessDenied(err error) bool {
+ // IsDuplicateKey reports whether err is a uniqueness violation: MySQL 1062
+ // (ER_DUP_ENTRY) and its multi-row sibling 1586 (ER_DUP_ENTRY_WITH_KEY_NAME).
+ // Dolt reports both through the same codes.
++// IsInvalidHashLength reports Dolt's adaptive-encoding panic/error surface
++// (dolt#11131): reading a drifted cell fails with an "invalid hash length"
++// message before the caller can inspect the row. The matcher is deliberately
++// narrow: this is a one-bug classifier, not a generic corruption bucket.
++func IsInvalidHashLength(err error) bool {
++	if err == nil {
++		return false
++	}
++	return strings.Contains(strings.ToLower(err.Error()), "invalid hash length")
++}
++
+ func IsDuplicateKey(err error) bool {
+ 	if err == nil {
+ 		return false
+diff --git a/internal/storage/dberrors/errors_test.go b/internal/storage/dberrors/errors_test.go
+index 4ddabb43..e1e0fd24 100644
+--- a/internal/storage/dberrors/errors_test.go
++++ b/internal/storage/dberrors/errors_test.go
+@@ -97,3 +97,28 @@ func TestIsMissingTable(t *testing.T) {
+ 		t.Error("IsMissingTable should match table names case-insensitively")
+ 	}
+ }
++
++func TestIsInvalidHashLength(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name string
++		err  error
++		want bool
++	}{
++		{name: "nil"},
++		{name: "plain", err: errors.New("invalid hash length: 19"), want: true},
++		{name: "wrapped mysql panic text", err: fmt.Errorf("read rows: %w", &mysql.MySQLError{Number: 1105, Message: "panic: invalid hash length: 1"}), want: true},
++		{name: "case-insensitive", err: errors.New("INVALID HASH LENGTH: 7"), want: true},
++		{name: "unrelated", err: errors.New("duplicate entry")},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			if got := IsInvalidHashLength(tc.err); got != tc.want {
++				t.Fatalf("IsInvalidHashLength(%v) = %v, want %v", tc.err, got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/internal/storage/schema/aux_row_id_backfill.go b/internal/storage/schema/aux_row_id_backfill.go
+index f562e814..0aa016cb 100644
+--- a/internal/storage/schema/aux_row_id_backfill.go
++++ b/internal/storage/schema/aux_row_id_backfill.go
+@@ -4,9 +4,11 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"fmt"
++	"log"
+ 	"sort"
+ 	"strings"
+ 
++	"github.com/steveyegge/beads/internal/storage/dberrors"
+ 	"github.com/steveyegge/beads/internal/storage/rowid"
+ )
+ 
+@@ -56,20 +58,68 @@ var auxRekeyPassDerivedInsert = auxRekeyPass{
+ // them.
+ var auxRekeyPasses = []auxRekeyPass{auxRekeyPassInitial, auxRekeyPassDerivedInsert}
+ 
++const auxRekeyDriftedKey = "aux_row_rekey_drifted"
++
++// auxRekeyRunResult reports what an aux-table rekey attempt changed. The
++// migration runner uses writtenTables to force-stage retry writes even when the
++// table was already dirty before the pass, and signatureExemptTables to omit
++// those same retry/drift tables from the changed-signature guard.
++type auxRekeyRunResult struct {
++	wrote                 bool
++	attempted             bool
++	writtenTables         map[string]struct{}
++	signatureExemptTables map[string]struct{}
++}
++
++func newAuxRekeyRunResult() auxRekeyRunResult {
++	return auxRekeyRunResult{
++		writtenTables:         make(map[string]struct{}),
++		signatureExemptTables: make(map[string]struct{}),
++	}
++}
++
++func (r *auxRekeyRunResult) markWritten(table string) {
++	r.wrote = true
++	r.writtenTables[table] = struct{}{}
++}
++
++func (r *auxRekeyRunResult) exemptSignature(table string) {
++	r.signatureExemptTables[table] = struct{}{}
++}
++
++func (r *auxRekeyRunResult) merge(other auxRekeyRunResult) {
++	r.wrote = r.wrote || other.wrote
++	r.attempted = r.attempted || other.attempted
++	for table := range other.writtenTables {
++		r.writtenTables[table] = struct{}{}
++	}
++	for table := range other.signatureExemptTables {
++		r.signatureExemptTables[table] = struct{}{}
++	}
++}
++
++func localMetadataExists(ctx context.Context, db DBConn) (bool, error) {
++	var tableCount int
++	if err := db.QueryRowContext(ctx,
++		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
++		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
++	).Scan(&tableCount); err != nil {
++		return false, err
++	}
++	return tableCount > 0, nil
++}
++
+ // auxRekeyResumePending reports whether a previous run of this re-key pass on
+ // this clone recorded the in-progress sentinel and never cleared it. A missing
+ // local_metadata table means no sentinel: the table is dolt-ignored and
+ // therefore clone-local, so a fresh clone lacks it until something recreates
+ // it — setAuxRekeyInProgress creates it on demand.
+ func auxRekeyResumePending(ctx context.Context, db DBConn, sentinelKey string) (bool, error) {
+-	var tableCount int
+-	if err := db.QueryRowContext(ctx,
+-		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+-		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
+-	).Scan(&tableCount); err != nil {
++	exists, err := localMetadataExists(ctx, db)
++	if err != nil {
+ 		return false, err
+ 	}
+-	if tableCount == 0 {
++	if !exists {
+ 		return false, nil
+ 	}
+ 	var n int
+@@ -86,14 +136,11 @@ func auxRekeyResumePending(ctx context.Context, db DBConn, sentinelKey string) (
+ // many passes exist — it feeds MigrateUp's dirty-table exemption, which only
+ // needs to know that some rekey rewrite is about to resume.
+ func anyAuxRekeyResumePending(ctx context.Context, db DBConn) (bool, error) {
+-	var tableCount int
+-	if err := db.QueryRowContext(ctx,
+-		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+-		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
+-	).Scan(&tableCount); err != nil {
++	exists, err := localMetadataExists(ctx, db)
++	if err != nil {
+ 		return false, err
+ 	}
+-	if tableCount == 0 {
++	if !exists {
+ 		return false, nil
+ 	}
+ 	placeholders := make([]string, len(auxRekeyPasses))
+@@ -111,15 +158,42 @@ func anyAuxRekeyResumePending(ctx context.Context, db DBConn) (bool, error) {
+ 	return n > 0, nil
+ }
+ 
+-func setAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string) error {
++func auxRekeyLocalMetadataStatus(ctx context.Context, db DBConn) (present bool, resuming bool, err error) {
++	present, err = localMetadataExists(ctx, db)
++	if err != nil || !present {
++		return present, false, err
++	}
++	placeholders := make([]string, len(auxRekeyPasses))
++	keys := make([]any, len(auxRekeyPasses))
++	for i, pass := range auxRekeyPasses {
++		placeholders[i] = "?"
++		keys[i] = pass.sentinelKey
++	}
++	var n int
++	if err := db.QueryRowContext(ctx,
++		fmt.Sprintf("SELECT COUNT(*) FROM local_metadata WHERE `key` IN (%s)", strings.Join(placeholders, ", ")),
++		keys...).Scan(&n); err != nil {
++		return true, false, err
++	}
++	return true, n > 0, nil
++}
++
++func ensureLocalMetadataTable(ctx context.Context, db DBConn) error {
+ 	// local_metadata is dolt-ignored, hence clone-local: a fresh clone whose
+ 	// main cursor is already past 0029 does not have the table (the migration
+ 	// will not re-run) until EnsureIgnoredTables recreates it. Create it here
+-	// with 0029's DDL — its dolt_ignore pattern is committed history, so the
+-	// sentinel stays clone-local.
++	// with 0029's DDL — its dolt_ignore pattern is committed history, so any
++	// sentinel/drift bookkeeping stays clone-local.
+ 	if _, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS local_metadata (`key` VARCHAR(255) PRIMARY KEY, value TEXT NOT NULL DEFAULT '')"); err != nil {
+ 		return fmt.Errorf("ensuring local_metadata: %w", err)
+ 	}
++	return nil
++}
++
++func setAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string) error {
++	if err := ensureLocalMetadataTable(ctx, db); err != nil {
++		return err
++	}
+ 	_, err := db.ExecContext(ctx,
+ 		"REPLACE INTO local_metadata (`key`, value) VALUES (?, '1')",
+ 		sentinelKey)
+@@ -133,6 +207,60 @@ func clearAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string)
+ 	return err
+ }
+ 
++func readAuxRekeyDriftedTables(ctx context.Context, db DBConn) (map[string]bool, error) {
++	exists, err := localMetadataExists(ctx, db)
++	if err != nil {
++		return nil, err
++	}
++	if !exists {
++		return map[string]bool{}, nil
++	}
++	return readAuxRekeyDriftedTablesKnownPresent(ctx, db)
++}
++
++func readAuxRekeyDriftedTablesKnownPresent(ctx context.Context, db DBConn) (map[string]bool, error) {
++	var value string
++	err := db.QueryRowContext(ctx,
++		"SELECT value FROM local_metadata WHERE `key` = ?",
++		auxRekeyDriftedKey).Scan(&value)
++	if err != nil {
++		if err == sql.ErrNoRows {
++			return map[string]bool{}, nil
++		}
++		return nil, err
++	}
++	out := make(map[string]bool)
++	for _, table := range strings.Split(value, ",") {
++		table = strings.TrimSpace(table)
++		if table != "" {
++			out[table] = true
++		}
++	}
++	return out, nil
++}
++
++func writeAuxRekeyDriftedTables(ctx context.Context, db DBConn, tables map[string]bool) error {
++	if len(tables) == 0 {
++		_, err := db.ExecContext(ctx,
++			"DELETE FROM local_metadata WHERE `key` = ?",
++			auxRekeyDriftedKey)
++		return err
++	}
++	if err := ensureLocalMetadataTable(ctx, db); err != nil {
++		return err
++	}
++	names := make([]string, 0, len(tables))
++	for table := range tables {
++		names = append(names, table)
++	}
++	sort.Strings(names)
++	_, err := db.ExecContext(ctx,
++		"REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)",
++		auxRekeyDriftedKey,
++		strings.Join(names, ","))
++	return err
++}
++
+ // auxRekeyTable describes one table covered by the re-key. columns is the
+ // frozen SELECT list of every non-id column, in creation order, with datetime
+ // columns CAST to CHAR server-side so the scanned text is identical across
+@@ -196,28 +324,30 @@ func rekeyAuxRowIDs(ctx context.Context, db DBConn, mainVersionBefore int, pass
+ 	if err != nil {
+ 		return false, fmt.Errorf("reading pending ignored migrations: %w", err)
+ 	}
+-	return rekeyAuxRowIDsPending(ctx, db, mainVersionBefore, pass, pending)
++	result, err := rekeyAuxRowIDsPending(ctx, db, mainVersionBefore, pass, pending)
++	return result.wrote, err
+ }
+ 
+ // rekeyAuxRowIDsAllPasses runs every convergence pass off a single read of
+ // the ignored cursor.
+-func rekeyAuxRowIDsAllPasses(ctx context.Context, db DBConn, mainVersionBefore int) (bool, error) {
++func rekeyAuxRowIDsAllPasses(ctx context.Context, db DBConn, mainVersionBefore int) (auxRekeyRunResult, error) {
+ 	pending, err := ignoredSource.pendingVersions(ctx, db)
+ 	if err != nil {
+-		return false, fmt.Errorf("reading pending ignored migrations: %w", err)
++		return auxRekeyRunResult{}, fmt.Errorf("reading pending ignored migrations: %w", err)
+ 	}
+-	wrote := false
++	result := newAuxRekeyRunResult()
+ 	for _, pass := range auxRekeyPasses {
+-		w, err := rekeyAuxRowIDsPending(ctx, db, mainVersionBefore, pass, pending)
+-		wrote = wrote || w
++		passResult, err := rekeyAuxRowIDsPending(ctx, db, mainVersionBefore, pass, pending)
++		result.merge(passResult)
+ 		if err != nil {
+-			return wrote, err
++			return result, err
+ 		}
+ 	}
+-	return wrote, nil
++	return result, nil
+ }
+ 
+-func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass, pending []int) (bool, error) {
++func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass, pending []int) (auxRekeyRunResult, error) {
++	result := newAuxRekeyRunResult()
+ 	markerPending := false
+ 	for _, v := range pending {
+ 		if v == pass.markerVersion {
+@@ -226,39 +356,90 @@ func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int
+ 		}
+ 	}
+ 	if !markerPending {
+-		return false, nil
++		return result, nil
+ 	}
+ 	resume, err := auxRekeyResumePending(ctx, db, pass.sentinelKey)
+ 	if err != nil {
+-		return false, fmt.Errorf("reading aux rekey sentinel: %w", err)
++		return result, fmt.Errorf("reading aux rekey sentinel: %w", err)
+ 	}
+ 	// The fresh-clone skip must not fire on a lineage whose previous pass
+ 	// crashed mid-rekey: that pass already advanced the main cursor past the
+ 	// shipped version, but its sentinel proves the rewrite never finished
+ 	// (bd-578h9.16).
+ 	if mainVersionBefore >= pass.shippedMainVersion && !resume {
+-		return false, nil
++		return result, nil
+ 	}
+ 
+ 	// Sentinel before the first UPDATE: a crash anywhere in the rewrite
+ 	// leaves it set, so the next pass resumes (the rewrite is idempotent)
+ 	// instead of recording the marker over partially re-keyed rows.
+ 	if err := setAuxRekeyInProgress(ctx, db, pass.sentinelKey); err != nil {
+-		return false, fmt.Errorf("recording aux rekey sentinel: %w", err)
++		return result, fmt.Errorf("recording aux rekey sentinel: %w", err)
+ 	}
++	result.attempted = true
+ 
+-	wrote := false
++	drifted := make(map[string]bool)
+ 	for _, t := range auxRekeyTables {
+ 		w, err := rekeyAuxRowTable(ctx, db, t)
+-		wrote = wrote || w
+-		if err != nil {
+-			return wrote, fmt.Errorf("%s: %w", t.name, err)
++		if w {
++			result.markWritten(t.name)
++		}
++		if err == nil {
++			continue
+ 		}
++		if dberrors.IsInvalidHashLength(err) {
++			drifted[t.name] = true
++			result.exemptSignature(t.name)
++			log.Printf("schema migration warning: aux-row rekey skipped %s due to clone-local Dolt encoding drift (%v); recorded in local_metadata.%s and will retry on a later migration pass", t.name, err, auxRekeyDriftedKey)
++			continue
++		}
++		return result, fmt.Errorf("%s: %w", t.name, err)
++	}
++	if err := writeAuxRekeyDriftedTables(ctx, db, drifted); err != nil {
++		return result, fmt.Errorf("recording aux rekey drift: %w", err)
+ 	}
+ 	if err := clearAuxRekeyInProgress(ctx, db, pass.sentinelKey); err != nil {
+-		return wrote, fmt.Errorf("clearing aux rekey sentinel: %w", err)
++		return result, fmt.Errorf("clearing aux rekey sentinel: %w", err)
++	}
++	return result, nil
++}
++
++// retryAuxRekeyDriftedTables retries only the tables previously recorded in the
++// clone-local drift record. This is the forward path for databases whose first
++// aux-row rekey pass had to skip a drifted table to stay openable.
++func retryAuxRekeyDriftedTables(ctx context.Context, db DBConn, drifted map[string]bool) (auxRekeyRunResult, error) {
++	result := newAuxRekeyRunResult()
++	if len(drifted) == 0 {
++		return result, nil
++	}
++	result.attempted = true
++	remaining := make(map[string]bool, len(drifted))
++	for table := range drifted {
++		remaining[table] = true
++		result.exemptSignature(table)
++	}
++	for _, t := range auxRekeyTables {
++		if !drifted[t.name] {
++			continue
++		}
++		w, err := rekeyAuxRowTable(ctx, db, t)
++		if w {
++			result.markWritten(t.name)
++		}
++		if err == nil {
++			delete(remaining, t.name)
++			continue
++		}
++		if dberrors.IsInvalidHashLength(err) {
++			log.Printf("schema migration warning: aux-row rekey retry skipped %s due to clone-local Dolt encoding drift (%v); leaving local_metadata.%s recorded for a later migration pass", t.name, err, auxRekeyDriftedKey)
++			continue
++		}
++		return result, fmt.Errorf("%s: %w", t.name, err)
++	}
++	if err := writeAuxRekeyDriftedTables(ctx, db, remaining); err != nil {
++		return result, fmt.Errorf("recording aux rekey drift: %w", err)
+ 	}
+-	return wrote, nil
++	return result, nil
+ }
+ 
+ // rekeyAuxRowTable re-derives the ids of one table. The whole table is grouped
+diff --git a/internal/storage/schema/aux_row_id_backfill_test.go b/internal/storage/schema/aux_row_id_backfill_test.go
+index 84ac7549..e81e4c06 100644
+--- a/internal/storage/schema/aux_row_id_backfill_test.go
++++ b/internal/storage/schema/aux_row_id_backfill_test.go
+@@ -5,6 +5,8 @@ import (
+ 	"database/sql"
+ 	"errors"
+ 	"regexp"
++	"sort"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/DATA-DOG/go-sqlmock"
+@@ -237,6 +239,7 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
+ 	for range auxRekeyTables {
+ 		expectColumnExists(mock, false)
+ 	}
++	expectWriteAuxRekeyDrift(mock)
+ 	expectClearAuxRekeySentinel(mock)
+ 
+ 	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
+@@ -336,6 +339,7 @@ func TestRekeyAuxRowIDsResumesAfterCrash(t *testing.T) {
+ 	for range auxRekeyTables {
+ 		expectColumnExists(mock, false)
+ 	}
++	expectWriteAuxRekeyDrift(mock)
+ 	expectClearAuxRekeySentinel(mock)
+ 
+ 	// Pre-pass cursor at the watershed — the crashed pass already migrated
+@@ -375,3 +379,102 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
+ 		t.Fatalf("unmet sql expectations: %v", err)
+ 	}
+ }
++
++func expectEventsSelect(mock sqlmock.Sqlmock) *sqlmock.ExpectedQuery {
++	return mock.ExpectQuery(regexp.QuoteMeta(
++		"SELECT id, issue_id, event_type, actor, old_value, new_value, comment, CAST(created_at AS CHAR) FROM events"))
++}
++
++func expectWriteAuxRekeyDrift(mock sqlmock.Sqlmock, tables ...string) {
++	if len(tables) == 0 {
++		mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
++			WithArgs(auxRekeyDriftedKey).
++			WillReturnResult(sqlmock.NewResult(0, 1))
++		return
++	}
++	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
++		WillReturnResult(sqlmock.NewResult(0, 0))
++	sorted := append([]string(nil), tables...)
++	sort.Strings(sorted)
++	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)")).
++		WithArgs(auxRekeyDriftedKey, strings.Join(sorted, ",")).
++		WillReturnResult(sqlmock.NewResult(0, 1))
++}
++
++func TestRekeyAuxRowIDsSkipsInvalidHashLengthAndRecordsDrift(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	expectCursorProbe(mock, "ignored_schema_migrations", true)
++	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
++		"version", auxRekeyPassInitial.markerVersion-1)
++	expectIgnoredSentinelProbes(mock, true)
++	expectAuxRekeySentinel(mock, false)
++	expectSetAuxRekeySentinel(mock)
++
++	expectColumnExists(mock, true)
++	expectEventsSelect(mock).
++		WillReturnError(errors.New("panic: invalid hash length: 19"))
++	for range auxRekeyTables[1:] {
++		expectColumnExists(mock, false)
++	}
++	expectWriteAuxRekeyDrift(mock, "events")
++	expectClearAuxRekeySentinel(mock)
++
++	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
++	if err != nil {
++		t.Fatalf("rekeyAuxRowIDs: %v", err)
++	}
++	if wrote {
++		t.Error("expected wrote=false when the drifted table was skipped before any updates")
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
++
++func TestRetryAuxRekeyDriftedTablesClearsHealedTablesAndKeepsDriftedOnes(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	expectColumnExists(mock, true)
++	expectEventsSelect(mock).
++		WillReturnError(errors.New("panic: invalid hash length: 19"))
++
++	digest := commentDigest("bd-1", "steve", "hello", "2026-06-09 12:00:00")
++	expectColumnExists(mock, true)
++	expectCommentsSelect(mock).
++		WillReturnRows(sqlmock.NewRows([]string{"id", "issue_id", "author", "text", "created_at"}).
++			AddRow("random-a", "bd-1", "steve", "hello", "2026-06-09 12:00:00"))
++	mock.ExpectExec(regexp.QuoteMeta("UPDATE comments SET id = ? WHERE id = ?")).
++		WithArgs(rowid.New("comments", 0, digest), "random-a").
++		WillReturnResult(sqlmock.NewResult(0, 1))
++
++	expectWriteAuxRekeyDrift(mock, "events")
++
++	result, err := retryAuxRekeyDriftedTables(context.Background(), db, map[string]bool{"events": true, "comments": true})
++	if err != nil {
++		t.Fatalf("retryAuxRekeyDriftedTables: %v", err)
++	}
++	if !result.wrote {
++		t.Fatal("expected wrote=true when a healed drifted table was re-keyed")
++	}
++	if _, ok := result.writtenTables["comments"]; !ok {
++		t.Fatalf("writtenTables = %v, want comments present", result.writtenTables)
++	}
++	if _, ok := result.signatureExemptTables["events"]; !ok {
++		t.Fatalf("signatureExemptTables = %v, want events present", result.signatureExemptTables)
++	}
++	if _, ok := result.signatureExemptTables["comments"]; !ok {
++		t.Fatalf("signatureExemptTables = %v, want comments present", result.signatureExemptTables)
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
+diff --git a/internal/storage/schema/schema.go b/internal/storage/schema/schema.go
+index 6779c1b7..cfc83f4f 100644
+--- a/internal/storage/schema/schema.go
++++ b/internal/storage/schema/schema.go
+@@ -664,9 +664,11 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+ 	// pre-existing user writes: dropping them from dirtyBefore exempts them
+ 	// from the changed-signature guard (the resumed rekey is about to change
+ 	// them) and lets stageSchemaTables commit them with the rest of the pass.
+-	if resuming, err := anyAuxRekeyResumePending(ctx, db); err != nil {
++	auxMetadataPresent, resuming, err := auxRekeyLocalMetadataStatus(ctx, db)
++	if err != nil {
+ 		return 0, fmt.Errorf("reading aux rekey sentinel: %w", err)
+-	} else if resuming {
++	}
++	if resuming {
+ 		for _, t := range auxRekeyTables {
+ 			delete(dirtyBefore, t.name)
+ 		}
+@@ -723,11 +725,26 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+ 	// rows minted with random UUIDv7 ids between the initial backfill and the
+ 	// switch to content-derived ids at insert time. Same machinery, own
+ 	// marker/sentinel/shipped-version gates, one shared cursor read.
+-	auxRekeyed, err := rekeyAuxRowIDsAllPasses(ctx, db, mainVersionBefore)
++	auxRekeyResult, err := rekeyAuxRowIDsAllPasses(ctx, db, mainVersionBefore)
+ 	if err != nil {
+ 		return applied, fmt.Errorf("rekey aux row ids: %w", err)
+ 	}
+-	backfilled = backfilled || auxRekeyed
++	backfilled = backfilled || auxRekeyResult.wrote
++	if !auxRekeyResult.attempted && auxMetadataPresent {
++		drifted, err := readAuxRekeyDriftedTablesKnownPresent(ctx, db)
++		if err != nil {
++			return applied, fmt.Errorf("reading aux rekey drift record: %w", err)
++		}
++		retryResult, err := retryAuxRekeyDriftedTables(ctx, db, drifted)
++		auxRekeyResult.merge(retryResult)
++		if err != nil {
++			return applied, fmt.Errorf("retry aux row ids: %w", err)
++		}
++		backfilled = backfilled || retryResult.wrote
++	}
++	for table := range auxRekeyResult.signatureExemptTables {
++		delete(dirtyBeforeSignatures, table)
++	}
+ 
+ 	touchedIgnoredDirtyTables, err := ignoredSource.pendingMigrationDirtyTables(ctx, db, dirtyBeforeAll)
+ 	if err != nil {
+@@ -766,7 +783,7 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+ 		return applied, fmt.Errorf("pre-existing dirty tables changed during schema migration: %s", strings.Join(changedDirtyTables, ", "))
+ 	}
+ 
+-	staged, err := stageSchemaTables(ctx, db, dirtyBefore)
++	staged, err := stageSchemaTables(ctx, db, dirtyBefore, auxRekeyResult.writtenTables)
+ 	if err != nil {
+ 		return applied, fmt.Errorf("staging migrations: %w", err)
+ 	}
+@@ -974,7 +991,7 @@ func writeSignatureValue(b *strings.Builder, v any) {
+ 	}
+ }
+ 
+-func stageSchemaTables(ctx context.Context, db DBConn, dirtyBefore map[string]dirtyTableState) (bool, error) {
++func stageSchemaTables(ctx context.Context, db DBConn, dirtyBefore map[string]dirtyTableState, forceStage map[string]struct{}) (bool, error) {
+ 	dirtyAfter, err := dirtyTables(ctx, db, true)
+ 	if err != nil {
+ 		return false, err
+@@ -982,6 +999,10 @@ func stageSchemaTables(ctx context.Context, db DBConn, dirtyBefore map[string]di
+ 
+ 	tableSet := make(map[string]struct{})
+ 	for table := range dirtyAfter {
++		if _, forced := forceStage[table]; forced {
++			tableSet[table] = struct{}{}
++			continue
++		}
+ 		if _, wasDirty := dirtyBefore[table]; wasDirty {
+ 			continue
+ 		}
+@@ -992,6 +1013,10 @@ func stageSchemaTables(ctx context.Context, db DBConn, dirtyBefore map[string]di
+ 		return false, err
+ 	}
+ 	for table := range tablesAfter {
++		if _, forced := forceStage[table]; forced {
++			tableSet[table] = struct{}{}
++			continue
++		}
+ 		if _, wasDirty := dirtyBefore[table]; wasDirty {
+ 			continue
+ 		}
+diff --git a/internal/storage/schema/schema_test.go b/internal/storage/schema/schema_test.go
+index 7b4aad28..e18496a3 100644
+--- a/internal/storage/schema/schema_test.go
++++ b/internal/storage/schema/schema_test.go
+@@ -2139,7 +2139,7 @@ func TestStageSchemaTablesSkipsIgnoredTables(t *testing.T) {
+ 		WithArgs("schema_migrations").
+ 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+ 
+-	staged, err := stageSchemaTables(context.Background(), db, map[string]dirtyTableState{})
++	staged, err := stageSchemaTables(context.Background(), db, map[string]dirtyTableState{}, nil)
+ 	if err != nil {
+ 		t.Fatalf("stageSchemaTables: %v", err)
+ 	}
+diff --git a/internal/storage/schema/stage_schema_tables_test.go b/internal/storage/schema/stage_schema_tables_test.go
+new file mode 100644
+index 00000000..b4cb1a3b
+--- /dev/null
++++ b/internal/storage/schema/stage_schema_tables_test.go
+@@ -0,0 +1,39 @@
++package schema
++
++import (
++	"context"
++	"regexp"
++	"testing"
++
++	"github.com/DATA-DOG/go-sqlmock"
++)
++
++func TestStageSchemaTablesForceStagesRequestedDirtyTable(t *testing.T) {
++	db, mock, err := sqlmock.New()
++	if err != nil {
++		t.Fatalf("sqlmock.New: %v", err)
++	}
++	defer db.Close()
++
++	mock.ExpectQuery("(?s)SELECT s\\.table_name, s\\.staged\\s+FROM dolt_status s").
++		WillReturnRows(sqlmock.NewRows([]string{"table_name", "staged"}).AddRow("comments", false))
++	mock.ExpectQuery(`SELECT t\.TABLE_NAME\s+FROM INFORMATION_SCHEMA\.TABLES t`).
++		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("comments"))
++	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('-f', ?)")).
++		WithArgs("comments").
++		WillReturnRows(sqlmock.NewRows([]string{"status"}))
++
++	staged, err := stageSchemaTables(context.Background(), db,
++		map[string]dirtyTableState{"comments": {staged: false}},
++		map[string]struct{}{"comments": {}},
++	)
++	if err != nil {
++		t.Fatalf("stageSchemaTables: %v", err)
++	}
++	if !staged {
++		t.Fatal("expected staged=true when forceStage names a pre-existing dirty table")
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet sql expectations: %v", err)
++	}
++}
+diff --git a/tmp/repro_invalid_hash_length.sh b/tmp/repro_invalid_hash_length.sh
+new file mode 100755
+index 00000000..03111ba6
+--- /dev/null
++++ b/tmp/repro_invalid_hash_length.sh
+@@ -0,0 +1,7 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++
++go test ./internal/storage/schema ./internal/storage/dberrors \
++  -run 'Test(RekeyAuxRowIDsSkipsInvalidHashLengthAndRecordsDrift|RetryAuxRekeyDriftedTablesClearsHealedTablesAndKeepsDriftedOnes|StageSchemaTablesForceStagesRequestedDirtyTable|IsInvalidHashLength)$' \
++  -count=1
