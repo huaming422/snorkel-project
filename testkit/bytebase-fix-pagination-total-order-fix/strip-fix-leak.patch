@@ -1,0 +1,28 @@
+diff --git a/docs/design/v1-api-audit-2026-08.md b/docs/design/v1-api-audit-2026-08.md
+index e09d641..460f8d5 100644
+--- a/docs/design/v1-api-audit-2026-08.md
++++ b/docs/design/v1-api-audit-2026-08.md
+@@ -12,7 +12,6 @@ noted. Fixed findings are removed and listed at the end.
+ |---|---|---|
+ | T15 | Rotating a leaked cloud credential can silently do nothing | HIGH |
+ | T13 | "Waiting for my approval" can show an empty page with a live Load More | HIGH |
+-| T14 | Paging through issues across projects skips some and repeats others | HIGH |
+ | T18a | Test-environment rights can cancel a running production migration | MED |
+ | T12 | Anonymous callers can enumerate emails, relay mail, and read your LDAP config | MED |
+ | T16 | Four `BatchGet` RPCs behave four different ways when an item is missing | MED |
+@@ -120,15 +119,6 @@ This is the default My Issues view, and there's no empty-page workaround on the
+ 
+ (Same shape as the `SearchProjects` bug that parked patch `03` fixes — also still unmerged.)
+ 
+-### T14 · Paging issues across projects skips and repeats rows — HIGH
+-
+-Issue IDs restart from 1 in each project, but the cross-project list sorts by ID alone. Issues from
+-different projects constantly share an ID, and tied rows can land in a different order on each query
+-— so paging forward drops some issues entirely and shows others twice. My Issues always queries
+-across all projects, so this is the common path, not an edge case.
+-
+-**Fix:** sort by `(project, id)`, which is the primary key. `store/issue.go:323`
+-
+ ### T16 · Four `BatchGet` RPCs, four behaviors — MED
+ 
+ Ask for five databases and get three back, with no way to tell which two are missing. Ask for five

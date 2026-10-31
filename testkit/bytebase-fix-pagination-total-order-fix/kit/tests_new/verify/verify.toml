@@ -1,0 +1,28 @@
+# Go runner config (see runners/go.py for the contract).
+#
+# One external-package test file, verify_pagination_test.go, declaring
+# `package store_test`. The runner copies it into backend/store/ and runs
+# `go test ./backend/store -run <every Test func in the file>`. Each test drives
+# the public store API against the local PostgreSQL that tests/test-setup.sh
+# starts, creating its own fresh database per test (the repo's own store tests
+# use testcontainers, which needs a Docker daemon and an image pull, and the
+# offline test run has neither).
+#
+# package: relative to the repo module root (go.mod is at the repo root, module
+# github.com/bytebase/bytebase), so the store package is backend/store.
+#
+# timeout: the dominant cost is the cold `go test` compile of the store test
+# binary and its transitive deps, plus per-test CREATE DATABASE + full schema
+# migration on the local server. 840 s is generous headroom on a warm module
+# and build cache and stays under the task's 900 s test budget.
+#
+# env: GOTOOLCHAIN=local pins the baked Go toolchain so `go test` never tries to
+# fetch a newer one; GOFLAGS=-mod=mod + GOPROXY=off allow on-the-fly module
+# resolution from the warm cache without reaching the network. These mirror what
+# tests/test-setup.sh exports and are restated here so the runner's child
+# process has them even if the file was not sourced.
+
+[go]
+package = "backend/store"
+timeout = 840
+env = { GOTOOLCHAIN = "local", GOFLAGS = "-mod=mod", GOPROXY = "off" }

@@ -1,0 +1,7 @@
+FROM bytebase-fix-pagination-total-order:latest
+USER root
+COPY kit /kit
+RUN mkdir -p /tests /logs/verifier
+# Compile the store package and its test deps once at the pinned commit, so each
+# case starts from a warm build cache. No test runs here.
+RUN cd /repo/bytebase && go test -count=1 -run '^$' -exec /bin/true ./backend/store > /tmp/kit-warm.log 2>&1 || tail -20 /tmp/kit-warm.log

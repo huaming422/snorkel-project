@@ -1,0 +1,361 @@
+diff --git a/backend/store/access_grant.go b/backend/store/access_grant.go
+index d6a1dc99f4..d4a24a6eaf 100644
+--- a/backend/store/access_grant.go
++++ b/backend/store/access_grant.go
+@@ -137,15 +137,17 @@ func (s *Store) ListAccessGrants(ctx context.Context, find *FindAccessGrantMessa
+ 		q.And("creator = ?", *v)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY created_at DESC")
++	// created_at defaults to now() and is not unique; id is the primary key and
++	// makes the ordering total, so offset pages cannot skip or repeat.
++	orderBy := []string{}
++	for _, v := range find.OrderByKeys {
++		orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
++	}
++	if len(orderBy) == 0 {
++		orderBy = append(orderBy, "access_grant.created_at DESC")
+ 	}
++	orderBy = append(orderBy, "access_grant.id DESC")
++	q.Space("ORDER BY " + strings.Join(orderBy, ", "))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/audit_log.go b/backend/store/audit_log.go
+index 41a534fe96..da396dc712 100644
+--- a/backend/store/audit_log.go
++++ b/backend/store/audit_log.go
+@@ -72,15 +72,17 @@ func (s *Store) SearchAuditLogs(ctx context.Context, find *AuditLogFind) ([]*Aud
+ 		q.And("payload->>'parent' = ?", *v)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY created_at DESC")
++	// created_at defaults to now() and is not unique; resource_id is the
++	// primary key. Audit exports page through this at 5000 rows a time.
++	orderBy := []string{}
++	for _, v := range find.OrderByKeys {
++		orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
++	}
++	if len(orderBy) == 0 {
++		orderBy = append(orderBy, "created_at DESC")
+ 	}
++	orderBy = append(orderBy, "audit_log.resource_id DESC")
++	q.Space("ORDER BY " + strings.Join(orderBy, ", "))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/changelog.go b/backend/store/changelog.go
+index 893359fba3..a18b23bd57 100644
+--- a/backend/store/changelog.go
++++ b/backend/store/changelog.go
+@@ -192,6 +192,8 @@ func buildListChangelogsQuery(find *FindChangelogMessage) (string, []any, error)
+ 		q.And("changelog.created_at < ?", *v)
+ 	}
+ 
++	// created_at defaults to now() and is not unique; resource_id is the
++	// primary key, and completes the ordering so offset pages stay stable.
+ 	q.Space("ORDER BY changelog.created_at DESC, changelog.resource_id DESC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/database.go b/backend/store/database.go
+index 1aea384f87..6f7a807910 100644
+--- a/backend/store/database.go
++++ b/backend/store/database.go
+@@ -192,15 +192,23 @@ func (s *Store) ListDatabases(ctx context.Context, find *FindDatabaseMessage) ([
+ 		WHERE ?
+ 	`, from, where)
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY db.project, db.instance, db.name")
+-	}
++	// Neither project nor name identifies a database; (instance, name) is the
++	// primary key. That stays unique in the result only because every join
++	// above is at most 1:1 — db_schema is joined on its own full primary key,
++	// and instance.resource_id is a primary key. A one-to-many join added here
++	// would duplicate rows and silently un-stabilize paging again.
++	//
++	// A caller sorting by instance or name repeats that column below, which
++	// PostgreSQL ignores as a redundant sort key.
++	orderBy := []string{}
++	for _, v := range find.OrderByKeys {
++		orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
++	}
++	if len(orderBy) == 0 {
++		orderBy = append(orderBy, "db.project ASC")
++	}
++	orderBy = append(orderBy, "db.instance ASC", "db.name ASC")
++	q.Space("ORDER BY " + strings.Join(orderBy, ", "))
+ 
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/group.go b/backend/store/group.go
+index e4a39e0ed3..c64ca7b4a9 100644
+--- a/backend/store/group.go
++++ b/backend/store/group.go
+@@ -141,9 +141,14 @@ func (s *Store) ListGroups(ctx context.Context, find *FindGroupMessage) ([]*Grou
+ 			user_group.payload
+ 		FROM ?
+ 		WHERE ?
+-		ORDER BY email
+ 	`, from, where)
+ 
++	// email is nullable — CreateGroup writes NULL for an empty one — and its
++	// unique index is partial, so it does not identify a group. id is the
++	// primary key, and stays unique in the result because the project filter
++	// joins a single-row ARRAY_AGG CTE rather than the member rows themselves.
++	q.Space("ORDER BY user_group.email ASC, user_group.id ASC")
++
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/instance.go b/backend/store/instance.go
+index 3219905fc8..d6c31a3f06 100644
+--- a/backend/store/instance.go
++++ b/backend/store/instance.go
+@@ -137,15 +137,13 @@ func (s *Store) ListInstances(ctx context.Context, find *FindInstanceMessage) ([
+ 		WHERE ?
+ 	`, where)
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY resource_id ASC")
++	// Titles and environments are not unique; resource_id is the primary key.
++	orderBy := []string{}
++	for _, v := range find.OrderByKeys {
++		orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+ 	}
++	orderBy = append(orderBy, "instance.resource_id ASC")
++	q.Space("ORDER BY " + strings.Join(orderBy, ", "))
+ 
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/issue.go b/backend/store/issue.go
+index 27343615fe..624c326e1f 100644
+--- a/backend/store/issue.go
++++ b/backend/store/issue.go
+@@ -320,7 +320,10 @@ func updateIssue(ctx context.Context, executor issueUpdateExecutor, projectID st
+ 
+ // ListIssues returns the list of issues by find query.
+ func (s *Store) ListIssues(ctx context.Context, find *FindIssueMessage) ([]*IssueMessage, error) {
+-	orderByClause := "ORDER BY issue.id DESC"
++	// Relevance ranking is derived from the query text rather than requested by
++	// the caller, so it is tracked apart from find.OrderByKeys. Set when the
++	// caller supplied query text that produced a tsquery.
++	var rankOrder string
+ 	from := qb.Q().Space("issue")
+ 	where := qb.Q()
+ 
+@@ -371,7 +374,7 @@ func (s *Store) ListIssues(ctx context.Context, find *FindIssueMessage) ([]*Issu
+ 		if tsQuery := getTSQuery(*v); tsQuery != "" {
+ 			from.Space("LEFT JOIN CAST(? AS tsquery) AS query ON TRUE", tsQuery)
+ 			searchCondition.Or("issue.ts_vector @@ query")
+-			orderByClause = "ORDER BY ts_rank(issue.ts_vector, query) DESC, issue.id DESC"
++			rankOrder = "ts_rank(issue.ts_vector, query) DESC"
+ 		}
+ 		searchCondition.Or("issue.name ILIKE ?", "%"+*v+"%")
+ 		where.And("(?)", searchCondition)
+@@ -397,14 +400,24 @@ func (s *Store) ListIssues(ctx context.Context, find *FindIssueMessage) ([]*Issu
+ 		where.And("COALESCE(issue.payload->>'draft', 'false') = 'false'")
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 && orderByClause == "ORDER BY issue.id DESC" {
+-		parts := make([]string, 0, len(find.OrderByKeys)+1)
++	// issue.id alone is not unique across projects — nextProjectID floors every
++	// project's first issue at 101 — so issue.project completes the
++	// (project, id) primary key and makes the ordering total.
++	//
++	// Which key leads is unchanged: relevance ranking still replaces the
++	// caller's order_by outright, and issue.id is still a per-project counter
++	// rather than a recency ordering across projects. Both are real problems,
++	// and both are separate ones.
++	orderBy := []string{}
++	if rankOrder != "" {
++		orderBy = append(orderBy, rankOrder)
++	} else {
+ 		for _, v := range find.OrderByKeys {
+-			parts = append(parts, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
++			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+ 		}
+-		parts = append(parts, "issue.id DESC")
+-		orderByClause = fmt.Sprintf("ORDER BY %s", strings.Join(parts, ", "))
+ 	}
++	orderBy = append(orderBy, "issue.id DESC")
++	orderByClause := "ORDER BY " + strings.Join(orderBy, ", ")
+ 
+ 	q := qb.Q().Space(`
+ 		SELECT
+diff --git a/backend/store/issue_comment.go b/backend/store/issue_comment.go
+index ae9200d768..628c8a12d3 100644
+--- a/backend/store/issue_comment.go
++++ b/backend/store/issue_comment.go
+@@ -74,7 +74,11 @@ func (s *Store) ListIssueComment(ctx context.Context, find *FindIssueCommentMess
+ 		q.And("issue_id = ?", *v)
+ 	}
+ 
+-	q.Space("ORDER BY created_at ASC")
++	// resource_id is the primary key. created_at alone would not be total —
++	// it defaults to now(), the transaction timestamp — so CreateIssueComments
++	// offsets each row of a batch by its ordinal to keep insertion order; see
++	// the comment there.
++	q.Space("ORDER BY issue_comment.created_at ASC, issue_comment.resource_id ASC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+@@ -146,9 +150,19 @@ func (s *Store) CreateIssueComments(ctx context.Context, creator string, creates
+ 	}
+ 
+ 	// Use UNNEST to insert all comments in one query.
++	//
++	// created_at defaults to now(), which is the transaction timestamp, so a
++	// batch would otherwise land on one instant and ListIssueComment could only
++	// fall back to its resource_id tiebreak — a random UUID, which scrambles the
++	// activity feed of a multi-field UpdateIssue. Offsetting each row by its
++	// ordinal keeps the batch in insertion order and makes created_at unique
++	// within it, at a cost of microseconds.
+ 	q := qb.Q().Space(`
+-		INSERT INTO issue_comment (creator, project, issue_id, payload)
+-		SELECT ?, unnest(?::TEXT[]), unnest(?::INT[]), unnest(?::JSONB[])
++		INSERT INTO issue_comment (creator, project, issue_id, payload, created_at, updated_at)
++		SELECT ?, c.project, c.issue_id, c.payload, t.at, t.at
++		FROM unnest(?::TEXT[], ?::INT[], ?::JSONB[])
++		     WITH ORDINALITY AS c(project, issue_id, payload, ordinality),
++		     LATERAL (SELECT now() + ((c.ordinality - 1) * interval '1 microsecond')) AS t(at)
+ 	`, creator, projectIDs, issueIDs, payloads)
+ 
+ 	// For single comment, use RETURNING to get the created comment details.
+diff --git a/backend/store/principal.go b/backend/store/principal.go
+index 96f3365b02..7fbbbe6bdf 100644
+--- a/backend/store/principal.go
++++ b/backend/store/principal.go
+@@ -271,9 +271,14 @@ func listUserImpl(ctx context.Context, txn *sql.Tx, find *FindUserMessage) ([]*U
+ 			principal.created_at
+ 		FROM ?
+ 		WHERE ?
+-		ORDER BY created_at ASC
+ 	`, from, where)
+ 
++	// created_at defaults to now(), so users provisioned by one SCIM sync
++	// share it; principal.id is the primary key, and stays unique in the result
++	// because the project and workspace filters join single-row ARRAY_AGG CTEs
++	// rather than the member rows themselves.
++	q.Space("ORDER BY principal.created_at ASC, principal.id ASC")
++
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/project.go b/backend/store/project.go
+index 0ed6cee7bc..698f833176 100644
+--- a/backend/store/project.go
++++ b/backend/store/project.go
+@@ -122,15 +122,13 @@ func (s *Store) ListProjects(ctx context.Context, find *FindProjectMessage) ([]*
+ 		q.And("deleted = ?", false)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY project.resource_id")
++	// Titles are not unique; resource_id is the primary key.
++	orderBy := []string{}
++	for _, v := range find.OrderByKeys {
++		orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+ 	}
++	orderBy = append(orderBy, "project.resource_id ASC")
++	q.Space("ORDER BY " + strings.Join(orderBy, ", "))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/release.go b/backend/store/release.go
+index 821cbeabae..bfbbf4d455 100644
+--- a/backend/store/release.go
++++ b/backend/store/release.go
+@@ -163,7 +163,9 @@ func (s *Store) ListReleases(ctx context.Context, find *FindReleaseMessage) ([]*
+ 		q.And("deleted = ?", false)
+ 	}
+ 
+-	q.Space("ORDER BY release.created_at DESC")
++	// created_at defaults to now() and is not unique; (project, train,
++	// iteration) is the primary key.
++	q.Space("ORDER BY release.created_at DESC, release.project DESC, release.train DESC, release.iteration DESC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/revision.go b/backend/store/revision.go
+index c4a3ca9ea6..0fc4d302e8 100644
+--- a/backend/store/revision.go
++++ b/backend/store/revision.go
+@@ -76,7 +76,10 @@ func (s *Store) ListRevisions(ctx context.Context, find *FindRevisionMessage) ([
+ 	if !find.ShowDeleted {
+ 		q.And("deleted_at IS NULL")
+ 	}
+-	q.Space("ORDER BY version DESC")
++	// version is unique only per (instance, db_name, type) and only while
++	// deleted_at IS NULL, so it does not identify a row on its own — least of
++	// all under ShowDeleted. resource_id is the primary key.
++	q.Space("ORDER BY revision.version DESC, revision.resource_id DESC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/service_account.go b/backend/store/service_account.go
+index 8126129e67..6097fa5742 100644
+--- a/backend/store/service_account.go
++++ b/backend/store/service_account.go
+@@ -127,9 +127,11 @@ func (s *Store) ListServiceAccounts(ctx context.Context, find *FindServiceAccoun
+ 			project
+ 		FROM service_account
+ 		WHERE ?
+-		ORDER BY created_at ASC
+ 	`, where)
+ 
++	// created_at defaults to now() and is not unique; email is the primary key.
++	q.Space("ORDER BY service_account.created_at ASC, service_account.email ASC")
++
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/workload_identity.go b/backend/store/workload_identity.go
+index 7ef6aeac0d..eed49dd0ca 100644
+--- a/backend/store/workload_identity.go
++++ b/backend/store/workload_identity.go
+@@ -138,9 +138,11 @@ func (s *Store) ListWorkloadIdentities(ctx context.Context, find *FindWorkloadId
+ 			config
+ 		FROM workload_identity
+ 		WHERE ?
+-		ORDER BY created_at ASC
+ 	`, where)
+ 
++	// created_at defaults to now() and is not unique; email is the primary key.
++	q.Space("ORDER BY workload_identity.created_at ASC, workload_identity.email ASC")
++
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}

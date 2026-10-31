@@ -1,0 +1,203 @@
+# Task image for bytebase-fix-pagination-total-order, derived from the
+# bytebase env Dockerfile (env-builder 2, authoring commit 4509e5cb2fdb) per
+# AUTHORING.md §1.2 "Deriving the task Dockerfile".
+#
+# Changes from the environment Dockerfile, and nothing else:
+#   - Step 9: ARG REPO_SHA default pinned to pre_fix_sha (3b491b17…).
+#   - Step 9: preparation patch removes one open finding from a design doc
+#     (AUTHORING.md §1.2 step 4).
+#   - Step 9.5: `go clean -cache` purge of code the authoring-commit warm
+#     compiled from the repo itself (AUTHORING.md §1.2 step 5).
+#   - A new numbered block bakes PostgreSQL 16 from the pgdg apt repo and
+#     configures a local cluster, so the offline test run can use a real
+#     Postgres (the repo's own tests use testcontainers, which pull an image at
+#     run time, and the working phase has no network; §1.5). Nothing the
+#     repository builds is affected.
+#   - GO_VERSION is left at the environment's value (1.27.1): block 8 warms at
+#     the authoring commit under GOTOOLCHAIN=local, whose go.mod names 1.27.1,
+#     so the local toolchain must be ≥ that; 1.27.1 compiles the pre-fix base
+#     (go.mod `go 1.26.5`) in 1.26 language mode. The store tests do not
+#     depend on the Go toolchain version.
+#
+# The working phase has no network, so the Go module cache, the build caches
+# and the baked Postgres must be complete at build time. allow_internet stays
+# true; it governs this build only.
+
+# 1. Base image (digest-pinned), bash with pipefail for every RUN, UTF-8 locale.
+FROM ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+# 2. Base OS packages: the fixed set every repository gets (transport, git, archive tools),
+#    nothing repo-specific, so this layer is shared. git trusts a differently-owned checkout
+#    system-wide: step 9 hands the checkout to the working user's uid and root still runs
+#    the dependency install over it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --system --add safe.directory '*'
+
+# 3. Verifier stack: own uv, own Python, own venv, all under /opt/tooling and off PATH.
+#    Byte-identical on every repo (src/resources/verifier.Dockerfile); nothing here refers to a repo ARG.
+# Canonical verifier runtime. Insert after apt/system packages and
+# before the repository language toolchain so same-repo images share the layer.
+# The pins are src/resources/verifier-requirements.txt inlined. BUILD_DATE
+# freezes their transitive resolution (UV_EXCLUDE_NEWER, this install only); it
+# may move forward per image but never before the newest pin's release. uv
+# counts the whole named day, so use a day that has already ended. The ARG may
+# instead sit with the image's other ARGs at the top of the final stage.
+ARG BUILD_DATE=2026-09-24
+RUN curl -LsSf https://astral.sh/uv/0.11.26/install.sh | env UV_INSTALL_DIR=/opt/tooling/uv UV_NO_MODIFY_PATH=1 sh \
+ && export UV_PYTHON_INSTALL_DIR=/opt/tooling/python UV_NO_CACHE=1 \
+ && /opt/tooling/uv/uv python install 3.12 \
+ && /opt/tooling/uv/uv venv --managed-python --python 3.12 /opt/tooling/venv \
+ && UV_EXCLUDE_NEWER=${BUILD_DATE} /opt/tooling/uv/uv pip install --python /opt/tooling/venv/bin/python \
+    pytest==9.1.1 requests==2.34.2 jinja2==3.1.6 litellm==1.93.0 pydantic==2.13.4 \
+    unidiff==0.7.5 pygments==2.20.0 ast-grep-py==0.44.1 mini-swe-agent==2.4.5 portkey-ai==2.3.3 \
+ && LITELLM_LOCAL_MODEL_COST_MAP=True /opt/tooling/venv/bin/python -c "import ast_grep_py, jinja2, litellm, minisweagent, portkey_ai, pydantic, pygments, pytest, requests, unidiff"
+
+# 4. Toolchain versions. One ARG each; the comment above it names the repo file it came from.
+#    Declared after the shared prefix so no value here can invalidate it; REPO_SHA is declared
+#    at step 9, where it is first used. (Docker has no trailing comments: a `#` after a value
+#    is part of the value, so every comment is on its own line.)
+# go.mod
+ARG GO_VERSION=1.27.1
+
+# 5. Repo OS packages: the build chain and headers this repository needs. No services.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 5a. PostgreSQL 16 server from the pgdg apt repo. The repository's own store
+#     tests connect through testcontainers-go, which pulls `postgres:16-alpine`
+#     and needs a Docker daemon at run time, and neither exists in the offline
+#     working phase or the offline test run. The test run instead points
+#     `store.New(...)` at a Postgres started locally by
+#     tests/test-setup.sh, matching the repo's test convention
+#     (user=postgres password=root-password database=postgres). Baking server 16
+#     keeps the server-major the suite expects. No service is started at build
+#     end; test-setup.sh starts the cluster for the test run.
+RUN install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt jammy-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        postgresql-16 postgresql-client-16 \
+    && rm -rf /var/lib/apt/lists/* \
+    # trust auth from localhost so the tests connect without a password;
+    # password is also set so the repo's root-password DSN authenticates.
+    && PG_CONF=/etc/postgresql/16/main/postgresql.conf \
+    && PG_HBA=/etc/postgresql/16/main/pg_hba.conf \
+    && sed -i \
+        -e "s/^#\?listen_addresses = .*/listen_addresses = 'localhost'/" \
+        -e "s/^#\?fsync = .*/fsync = off/" \
+        -e "s/^#\?synchronous_commit = .*/synchronous_commit = off/" \
+        -e "s/^#\?full_page_writes = .*/full_page_writes = off/" \
+        "$PG_CONF" \
+    && echo "host all all 127.0.0.1/32 trust" >> "$PG_HBA" \
+    && echo "host all all ::1/128 trust"      >> "$PG_HBA" \
+    && echo "local all all trust"             >> "$PG_HBA" \
+    && pg_ctlcluster 16 main start \
+    && su - postgres -c "psql -tAc \"ALTER USER postgres WITH PASSWORD 'root-password';\"" \
+    && pg_ctlcluster 16 main stop
+
+# 6. Go toolchain, exact version, per-arch tarball with the published sha256
+#    (dl.google.com hosts both files; go.dev/dl serves HTML for the .sha256 path).
+RUN ARCH="$(dpkg --print-architecture)" && case "$ARCH" in \
+      amd64|arm64) URL="https://dl.google.com/go/go${GO_VERSION}.linux-${ARCH}.tar.gz";; \
+      *) echo "unsupported arch $ARCH" >&2; exit 1;; esac \
+    && curl -fsSL -o /tmp/go.tgz "$URL" \
+    && curl -fsSL "${URL}.sha256" | sed "s|$|  /tmp/go.tgz|" | sha256sum -c - \
+    && tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz \
+    && /usr/local/go/bin/go version
+ENV PATH=/usr/local/go/bin:/root/go/bin:${PATH} GOPATH=/root/go \
+    GOMODCACHE=/opt/cache/go GOCACHE=/opt/cache/go-build GOTOOLCHAIN=local GOFLAGS=-mod=mod CGO_ENABLED=1
+
+# 7. Parallelism caps: only the tools this repository uses, sized to cpus = 4.
+ENV GOMAXPROCS=4
+# Never MAKEFLAGS.
+# Runner knobs for tools this repository does not use, declared so the caps lint reads a decision:
+# caps-skip: TURBO_CONCURRENCY VITEST_MAX_THREADS VITEST_MIN_THREADS CARGO_BUILD_JOBS RUST_TEST_THREADS PYTEST_XDIST_AUTO_NUM_WORKERS CMAKE_BUILD_PARALLEL_LEVEL
+# caps-skip: PG_MAX_PARALLEL_WORKERS: the baked Postgres serves the test run only, single-connection test workloads, not a parallelism knob the task tunes.
+
+# 8. Package-cache warm from the AUTHORING commit only. A shallow checkout of that one commit at
+#    the final checkout path (a compiler cache keys on source paths), the stack's fetch/compile
+#    warm into /opt/cache, then the checkout is deleted. The SHA here is written literally, not
+#    ${REPO_SHA}, so this layer is byte-identical for every build of the repo and builds once. A
+#    cache tree the working user will write is handed to its uid here, inside the layer that
+#    writes it.
+RUN git clone --depth=1 --single-branch --no-tags -b main https://github.com/bytebase/bytebase.git /repo/bytebase \
+    && cd /repo/bytebase \
+    && git fetch --depth=1 origin 4509e5cb2fdbd420817391b009bc7f2683e51a99 \
+    && git checkout --detach 4509e5cb2fdbd420817391b009bc7f2683e51a99 \
+    && ( go mod download all > /tmp/seed-go.log 2>&1 || (tail -50 /tmp/seed-go.log >&2; exit 1) ) \
+    && ( go build -o /tmp/go-build-out/ ./... >> /tmp/seed-go.log 2>&1 || echo 'go build ./... failed (see log); the test compile decides' >> /tmp/seed-go.log ) \
+    && ( go test -count=1 -run '^$' -exec /bin/true ./backend/tests ./backend/api/v1 ./backend/... ./action/... >> /tmp/seed-go.log 2>&1 || (grep -vE '^(\?|ok  |FAIL[[:space:]])' /tmp/seed-go.log | tail -60 >&2; exit 1) ) \
+    && cd / && rm -rf /repo/bytebase
+
+# 9. Clone, pin, prepare, scrub, baseline: ONE layer. REPO_SHA is the only thing here a later build
+#    changes. A lockfile the repo does not ship is generated here at the dependency cutoff. The
+#    baseline commit runs only when the tree is dirty (that generated lockfile);
+#    /var/lib/devcontainer_base_ref is the baseline the working tree is compared to. The checkout
+#    is handed to uid 1000 (the working user step 11 creates) in this same layer.
+# Declared here, not at the top: every ARG in scope is part of each later RUN's cache key, so
+# REPO_SHA must enter scope only where it is first used, or a rebuild at another commit would
+# rebuild every layer above the clone.
+ARG REPO_BRANCH=main
+ARG REPO_SHA=3b491b17df623666646bcc1cb4b500e3e6658167
+COPY strip-fix-leak.patch /tmp/strip-fix-leak.patch
+RUN git clone --single-branch --no-tags -b ${REPO_BRANCH} https://github.com/bytebase/bytebase.git /repo/bytebase \
+    && cd /repo/bytebase \
+    && git fetch --depth=1000 origin ${REPO_SHA} \
+    && git reset --hard ${REPO_SHA} \
+    # Preparation patch: removes one open finding from a design doc
+    # (docs/design/v1-api-audit-2026-08.md). The upstream change removes the same
+    # finding from that list; the patch is applied before scrub so it lands in the
+    # baseline.
+    && git apply --whitespace=nowarn /tmp/strip-fix-leak.patch \
+    && rm -f /tmp/strip-fix-leak.patch \
+    && git remote remove origin && rm -rf .git/refs/remotes \
+    && rm -f .git/FETCH_HEAD .git/ORIG_HEAD .git/packed-refs \
+    && printf '%s\n' "${REPO_SHA}" > /var/lib/repo_expected_sha \
+    && git add -A \
+    && if ! git diff --cached --quiet; then \
+         git -c user.email=automation@localhost -c user.name=devcontainer \
+           commit -m 'chore: initialize dev environment' --no-gpg-sign; fi \
+    && git rev-parse HEAD > /var/lib/devcontainer_base_ref \
+    && git reflog expire --expire=now --all && git gc --prune=now \
+    && chown -R 1000:1000 /repo/bytebase
+WORKDIR /repo/bytebase
+
+# 9.5. Purge what the authoring-commit warm (block 8) compiled from the repo's
+#      OWN code: that commit is newer than this task's base and its build-cache
+#      entries can hold code from after the base. The module cache stays;
+#      block 10 recompiles the repo at the base. AUTHORING.md §1.2 step 5.
+RUN go clean -cache
+
+# 10. Dependencies and build caches at THIS commit, for the whole unit tree.
+#    `go test -run '^$' -exec /bin/true` compiles every test binary and runs none (a TestMain that
+#    needs a cluster or a docker daemon would panic otherwise).
+RUN go mod download > /tmp/deps-go.log 2>&1 || (tail -50 /tmp/deps-go.log >&2; exit 1) \
+    && ( go build -o /tmp/go-build-out/ ./... >> /tmp/deps-go.log 2>&1 || echo 'go build ./... failed (see log); the test compile decides' >> /tmp/deps-go.log ) \
+    && go test -count=1 -run '^$' -exec /bin/true ./backend/tests ./backend/api/v1 ./backend/... ./action/... >> /tmp/deps-go.log 2>&1 || (grep -vE '^(\?|ok  |FAIL[[:space:]])' /tmp/deps-go.log | tail -60 >&2; exit 1) \
+    && for p in /repo/bytebase; do if [ -e "$p" ]; then find "$p" ! -user 1000 -exec chown -h 1000:1000 {} +; fi; done
+
+# 11. Working user `dev` (uid 1000), created after every layer that writes the checkout or a
+#     dev-writable tree has handed its files to this uid inside that layer: an ownership or mode
+#     change here would copy each touched file into this layer, so only what is still wrong is
+#     touched (a file not yet dev-owned, a toolchain file others cannot read). Toolchains,
+#     package caches and the dependency tree stay root-owned and world-readable; the caches this
+#     user writes live under /home/dev (set in ENV and in /etc/environment for login shells).
+RUN /usr/sbin/useradd --uid 1000 --create-home --shell /bin/bash dev \
+    && id dev \
+    && for d in /opt/cache/go /opt/cache/go-build /usr/local/go; do if [ -e "$d" ]; then find "$d" \( \( -type f ! -perm -o=r \) -o \( -type d ! -perm -o=rx \) \) -exec chmod a+rX {} +; fi; done \
+    && for p in /repo/bytebase; do mkdir -p "$p" && find "$p" ! -user dev -exec chown -h dev:dev {} +; done \
+    && mkdir -p /home/dev/.cache && chown -R dev:dev /home/dev
+ENV GOCACHE=/home/dev/.cache/go-build \
+    GOPATH=/home/dev/go
+RUN printf '%s\n' 'GOMAXPROCS=4' 'GOCACHE=/home/dev/.cache/go-build' 'GOPATH=/home/dev/go' >> /etc/environment
+
+# 12. Services: Postgres 16 is baked (block 5a) for the store tests; it is NOT
+#     started here. tests/test-setup.sh starts the cluster for the test run.

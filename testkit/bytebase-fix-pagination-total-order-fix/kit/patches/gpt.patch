@@ -1,0 +1,593 @@
+diff --git a/backend/api/v1/issue_service.go b/backend/api/v1/issue_service.go
+index 19cc29e6..02ab4842 100644
+--- a/backend/api/v1/issue_service.go
++++ b/backend/api/v1/issue_service.go
+@@ -231,6 +231,93 @@ func (s *IssueService) getIssueFind(
+ 	return issueFind, filterIssue, nil
+ }
+ 
++func (f *filterIssueMessage) requiresPostFilter() bool {
++	return f != nil && (f.ApprovalStatus != nil || f.Approver != nil)
++}
++
++func paginateConvertedIssues(
++	page *pageOffset,
++	requiresPostFilter bool,
++	fetch func(limit, offset int) ([]*store.IssueMessage, error),
++	convert func([]*store.IssueMessage) ([]*v1pb.Issue, error),
++) ([]*v1pb.Issue, string, error) {
++	if !requiresPostFilter {
++		limitPlusOne := page.limit + 1
++		issues, err := fetch(limitPlusOne, page.offset)
++		if err != nil {
++			return nil, "", err
++		}
++		converted, err := convert(issues)
++		if err != nil {
++			return nil, "", err
++		}
++		if len(converted) <= page.limit {
++			return converted, "", nil
++		}
++		nextPageToken, err := page.getNextPageToken()
++		if err != nil {
++			return nil, "", err
++		}
++		return converted[:page.limit], nextPageToken, nil
++	}
++
++	batchSize := page.limit + 1
++	if batchSize < 100 {
++		batchSize = 100
++	}
++	skipped := 0
++	rawOffset := 0
++	convertedPage := make([]*v1pb.Issue, 0, page.limit+1)
++	for {
++		issues, err := fetch(batchSize, rawOffset)
++		if err != nil {
++			return nil, "", err
++		}
++		if len(issues) == 0 {
++			break
++		}
++
++		converted, err := convert(issues)
++		if err != nil {
++			return nil, "", err
++		}
++		for _, issue := range converted {
++			if skipped < page.offset {
++				skipped++
++				continue
++			}
++			convertedPage = append(convertedPage, issue)
++			if len(convertedPage) == page.limit+1 {
++				nextPageToken, err := page.getNextPageToken()
++				if err != nil {
++					return nil, "", err
++				}
++				return convertedPage[:page.limit], nextPageToken, nil
++			}
++		}
++		if len(issues) < batchSize {
++			break
++		}
++		rawOffset += len(issues)
++	}
++	return convertedPage, "", nil
++}
++
++func (s *IssueService) listPagedIssues(ctx context.Context, find *store.FindIssueMessage, issueFilter *filterIssueMessage, page *pageOffset) ([]*v1pb.Issue, string, error) {
++	return paginateConvertedIssues(
++		page,
++		issueFilter.requiresPostFilter(),
++		func(limit, offset int) ([]*store.IssueMessage, error) {
++			queryFind := *find
++			queryFind.Limit = &limit
++			queryFind.Offset = &offset
++			return s.store.ListIssues(ctx, &queryFind)
++		},
++		func(issues []*store.IssueMessage) ([]*v1pb.Issue, error) {
++			return s.convertToIssues(ctx, issues, issueFilter)
++		},
++	)
++}
+ func (s *IssueService) ListIssues(ctx context.Context, req *connect.Request[v1pb.ListIssuesRequest]) (*connect.Response[v1pb.ListIssuesResponse], error) {
+ 	if req.Msg.PageSize < 0 {
+ 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.Errorf("page size must be non-negative: %d", req.Msg.PageSize))
+@@ -249,9 +336,7 @@ func (s *IssueService) ListIssues(ctx context.Context, req *connect.Request[v1pb
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	limitPlusOne := offset.limit + 1
+-
+-	issueFind, issueFilter, err := s.getIssueFind(ctx, req.Msg.Filter, req.Msg.Query, &limitPlusOne, &offset.offset)
++	issueFind, issueFilter, err := s.getIssueFind(ctx, req.Msg.Filter, req.Msg.Query, nil, nil)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -264,23 +349,10 @@ func (s *IssueService) ListIssues(ctx context.Context, req *connect.Request[v1pb
+ 	}
+ 	issueFind.OrderByKeys = orderByKeys
+ 
+-	issues, err := s.store.ListIssues(ctx, issueFind)
++	converted, nextPageToken, err := s.listPagedIssues(ctx, issueFind, issueFilter, offset)
+ 	if err != nil {
+ 		return nil, connect.NewError(connect.CodeInternal, errors.Wrapf(err, "failed to search issue"))
+ 	}
+-
+-	var nextPageToken string
+-	if len(issues) == limitPlusOne {
+-		if nextPageToken, err = offset.getNextPageToken(); err != nil {
+-			return nil, connect.NewError(connect.CodeInternal, errors.Wrapf(err, "failed to get next page token"))
+-		}
+-		issues = issues[:offset.limit]
+-	}
+-
+-	converted, err := s.convertToIssues(ctx, issues, issueFilter)
+-	if err != nil {
+-		return nil, connect.NewError(connect.CodeInternal, errors.Wrapf(err, "failed to convert to issue"))
+-	}
+ 	return connect.NewResponse(&v1pb.ListIssuesResponse{
+ 		Issues:        converted,
+ 		NextPageToken: nextPageToken,
+@@ -305,9 +377,7 @@ func (s *IssueService) SearchIssues(ctx context.Context, req *connect.Request[v1
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	limitPlusOne := offset.limit + 1
+-
+-	issueFind, issueFilter, err := s.getIssueFind(ctx, req.Msg.Filter, req.Msg.Query, &limitPlusOne, &offset.offset)
++	issueFind, issueFilter, err := s.getIssueFind(ctx, req.Msg.Filter, req.Msg.Query, nil, nil)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -362,23 +432,10 @@ func (s *IssueService) SearchIssues(ctx context.Context, req *connect.Request[v1
+ 	issueFind.ProjectIDs = projectIDs
+ 	issueFind.ExcludeDraft = true
+ 
+-	issues, err := s.store.ListIssues(ctx, issueFind)
++	converted, nextPageToken, err := s.listPagedIssues(ctx, issueFind, issueFilter, offset)
+ 	if err != nil {
+ 		return nil, connect.NewError(connect.CodeInternal, errors.Wrapf(err, "failed to search issue"))
+ 	}
+-
+-	var nextPageToken string
+-	if len(issues) == limitPlusOne {
+-		if nextPageToken, err = offset.getNextPageToken(); err != nil {
+-			return nil, connect.NewError(connect.CodeInternal, errors.Wrapf(err, "failed to get next page token"))
+-		}
+-		issues = issues[:offset.limit]
+-	}
+-
+-	converted, err := s.convertToIssues(ctx, issues, issueFilter)
+-	if err != nil {
+-		return nil, connect.NewError(connect.CodeInternal, errors.Wrapf(err, "failed to convert to issue"))
+-	}
+ 	return connect.NewResponse(&v1pb.SearchIssuesResponse{
+ 		Issues:        converted,
+ 		NextPageToken: nextPageToken,
+diff --git a/backend/api/v1/issue_service_test.go b/backend/api/v1/issue_service_test.go
+index a337eed9..b9f550d8 100644
+--- a/backend/api/v1/issue_service_test.go
++++ b/backend/api/v1/issue_service_test.go
+@@ -28,6 +28,96 @@ import (
+ 	_ "github.com/bytebase/bytebase/backend/plugin/db/pg"
+ )
+ 
++func TestPaginateConvertedIssuesWithPostFilter(t *testing.T) {
++	raw := []*store.IssueMessage{
++		{ProjectID: "project-a", UID: 4},
++		{ProjectID: "project-a", UID: 3},
++		{ProjectID: "project-a", UID: 2},
++		{ProjectID: "project-a", UID: 1},
++	}
++	fetch := func(limit, offset int) ([]*store.IssueMessage, error) {
++		if offset >= len(raw) {
++			return nil, nil
++		}
++		end := offset + limit
++		if end > len(raw) {
++			end = len(raw)
++		}
++		return raw[offset:end], nil
++	}
++	convert := func(issues []*store.IssueMessage) ([]*v1pb.Issue, error) {
++		var out []*v1pb.Issue
++		for _, issue := range issues {
++			if issue.UID%2 == 1 {
++				continue
++			}
++			out = append(out, &v1pb.Issue{Name: common.FormatIssue(issue.ProjectID, issue.UID)})
++		}
++		return out, nil
++	}
++
++	firstPage, nextPageToken, err := paginateConvertedIssues(&pageOffset{limit: 1, offset: 0}, true, fetch, convert)
++	require.NoError(t, err)
++	require.Equal(t, []*v1pb.Issue{{Name: "projects/project-a/issues/4"}}, firstPage)
++	require.NotEmpty(t, nextPageToken)
++
++	secondPage, nextPageToken, err := paginateConvertedIssues(&pageOffset{limit: 1, offset: 1}, true, fetch, convert)
++	require.NoError(t, err)
++	require.Equal(t, []*v1pb.Issue{{Name: "projects/project-a/issues/2"}}, secondPage)
++	require.Empty(t, nextPageToken)
++}
++
++func TestSearchIssuesPaginationWithPostFilterIsStable(t *testing.T) {
++	ctx := issueServiceTestContext()
++	stores := setupIssueServiceTestStore(ctx, t)
++	service := newIssueServiceForTest(t, stores)
++
++	for i := 0; i < 4; i++ {
++		payload := &storepb.Issue{}
++		if i%2 == 1 {
++			payload.Approval = &storepb.IssuePayloadApproval{
++				ApprovalTemplate: &storepb.ApprovalTemplate{
++					Flow: &storepb.ApprovalFlow{Roles: []string{"roles/workspaceAdmin"}},
++				},
++				ApprovalFindingDone: true,
++			}
++		}
++		_, err := stores.CreateIssue(ctx, &store.IssueMessage{
++			ProjectID:    "project-a",
++			CreatorEmail: "creator@example.com",
++			Title:        fmt.Sprintf("issue-%d", i),
++			Type:         storepb.Issue_DATABASE_CHANGE,
++			Description:  "",
++			Payload:      payload,
++		})
++		require.NoError(t, err)
++	}
++
++	pageToken := ""
++	var got []string
++	for {
++		resp, err := service.SearchIssues(ctx, connect.NewRequest(&v1pb.SearchIssuesRequest{
++			Parent:    "projects/-",
++			PageSize:  1,
++			PageToken: pageToken,
++			Filter:    `status in ["OPEN"] && approval_status == "PENDING" && current_approver == "users/creator@example.com"`,
++		}))
++		require.NoError(t, err)
++		for _, issue := range resp.Msg.Issues {
++			got = append(got, issue.Name)
++		}
++		if resp.Msg.NextPageToken == "" {
++			break
++		}
++		pageToken = resp.Msg.NextPageToken
++	}
++
++	require.Equal(t, []string{
++		"projects/project-a/issues/4",
++		"projects/project-a/issues/2",
++	}, got)
++}
++
+ func TestDraftLabelUpdateConflictsWithConcurrentSubmission(t *testing.T) {
+ 	ctx := issueServiceTestContext()
+ 	stores := setupIssueServiceTestStore(ctx, t)
+diff --git a/backend/store/access_grant.go b/backend/store/access_grant.go
+index d6a1dc99..0b3a5749 100644
+--- a/backend/store/access_grant.go
++++ b/backend/store/access_grant.go
+@@ -2,7 +2,6 @@ package store
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"strings"
+ 	"time"
+ 
+@@ -137,15 +136,11 @@ func (s *Store) ListAccessGrants(ctx context.Context, find *FindAccessGrantMessa
+ 		q.And("creator = ?", *v)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY created_at DESC")
+-	}
++	q.Space(buildStableOrderByClause(
++		find.OrderByKeys,
++		[]*OrderByKey{{Key: "created_at", SortOrder: DESC}},
++		[]*OrderByKey{{Key: "id"}},
++	))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/audit_log.go b/backend/store/audit_log.go
+index 41a534fe..34a9e6bf 100644
+--- a/backend/store/audit_log.go
++++ b/backend/store/audit_log.go
+@@ -3,7 +3,6 @@ package store
+ import (
+ 	"context"
+ 	"fmt"
+-	"strings"
+ 	"time"
+ 
+ 	"github.com/google/cel-go/cel"
+@@ -72,15 +71,11 @@ func (s *Store) SearchAuditLogs(ctx context.Context, find *AuditLogFind) ([]*Aud
+ 		q.And("payload->>'parent' = ?", *v)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY created_at DESC")
+-	}
++	q.Space(buildStableOrderByClause(
++		find.OrderByKeys,
++		[]*OrderByKey{{Key: "created_at", SortOrder: DESC}},
++		[]*OrderByKey{{Key: "resource_id"}},
++	))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/common.go b/backend/store/common.go
+index 9163e3ce..865a6a15 100644
+--- a/backend/store/common.go
++++ b/backend/store/common.go
+@@ -1,6 +1,7 @@
+ package store
+ 
+ import (
++	"fmt"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -99,3 +100,39 @@ func parseOrderBy(orderBy string) ([]*OrderByKey, error) {
+ 	}
+ 	return result, nil
+ }
++
++// buildStableOrderByClause builds an ORDER BY clause and appends hidden
++// tiebreak keys so OFFSET-based pagination stays stable even when the visible
++// sort keys are not unique. A tiebreak key with an empty SortOrder inherits the
++// final explicit sort direction from the primary keys (or ASC if none exist).
++func buildStableOrderByClause(keys, defaultKeys, tieBreakers []*OrderByKey) string {
++	orderKeys := keys
++	if len(orderKeys) == 0 {
++		orderKeys = defaultKeys
++	}
++	if len(orderKeys) == 0 && len(tieBreakers) == 0 {
++		return ""
++	}
++
++	parts := make([]string, 0, len(orderKeys)+len(tieBreakers))
++	seen := make(map[string]bool, len(orderKeys))
++	lastSortOrder := ASC
++	for _, key := range orderKeys {
++		parts = append(parts, fmt.Sprintf("%s %s", key.Key, key.SortOrder.String()))
++		seen[key.Key] = true
++		if key.SortOrder != "" {
++			lastSortOrder = key.SortOrder
++		}
++	}
++	for _, key := range tieBreakers {
++		if seen[key.Key] {
++			continue
++		}
++		sortOrder := key.SortOrder
++		if sortOrder == "" {
++			sortOrder = lastSortOrder
++		}
++		parts = append(parts, fmt.Sprintf("%s %s", key.Key, sortOrder.String()))
++	}
++	return fmt.Sprintf("ORDER BY %s", strings.Join(parts, ", "))
++}
+diff --git a/backend/store/common_test.go b/backend/store/common_test.go
+index b3a93ccc..ec2666df 100644
+--- a/backend/store/common_test.go
++++ b/backend/store/common_test.go
+@@ -55,3 +55,20 @@ func TestParseOrderBy(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestBuildStableOrderByClause(t *testing.T) {
++	t.Run("default order plus explicit tiebreak", func(t *testing.T) {
++		got := buildStableOrderByClause(nil, []*OrderByKey{{Key: "created_at", SortOrder: DESC}}, []*OrderByKey{{Key: "id"}})
++		require.Equal(t, "ORDER BY created_at DESC, id DESC", got)
++	})
++
++	t.Run("requested order inherits final direction for tiebreak", func(t *testing.T) {
++		got := buildStableOrderByClause([]*OrderByKey{{Key: "name", SortOrder: ASC}}, nil, []*OrderByKey{{Key: "resource_id"}})
++		require.Equal(t, "ORDER BY name ASC, resource_id ASC", got)
++	})
++
++	t.Run("existing tiebreak key is not duplicated", func(t *testing.T) {
++		got := buildStableOrderByClause([]*OrderByKey{{Key: "resource_id", SortOrder: DESC}}, nil, []*OrderByKey{{Key: "resource_id"}})
++		require.Equal(t, "ORDER BY resource_id DESC", got)
++	})
++}
+diff --git a/backend/store/database.go b/backend/store/database.go
+index 1aea384f..fc180939 100644
+--- a/backend/store/database.go
++++ b/backend/store/database.go
+@@ -192,15 +192,19 @@ func (s *Store) ListDatabases(ctx context.Context, find *FindDatabaseMessage) ([
+ 		WHERE ?
+ 	`, from, where)
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY db.project, db.instance, db.name")
+-	}
++	q.Space(buildStableOrderByClause(
++		find.OrderByKeys,
++		[]*OrderByKey{
++			{Key: "db.project", SortOrder: ASC},
++			{Key: "db.instance", SortOrder: ASC},
++			{Key: "db.name", SortOrder: ASC},
++		},
++		[]*OrderByKey{
++			{Key: "db.project"},
++			{Key: "db.instance"},
++			{Key: "db.name"},
++		},
++	))
+ 
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/instance.go b/backend/store/instance.go
+index 3219905f..4cce952a 100644
+--- a/backend/store/instance.go
++++ b/backend/store/instance.go
+@@ -137,15 +137,11 @@ func (s *Store) ListInstances(ctx context.Context, find *FindInstanceMessage) ([
+ 		WHERE ?
+ 	`, where)
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY resource_id ASC")
+-	}
++	q.Space(buildStableOrderByClause(
++		find.OrderByKeys,
++		[]*OrderByKey{{Key: "resource_id", SortOrder: ASC}},
++		[]*OrderByKey{{Key: "resource_id"}},
++	))
+ 
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/issue.go b/backend/store/issue.go
+index 27343615..52385ac6 100644
+--- a/backend/store/issue.go
++++ b/backend/store/issue.go
+@@ -398,12 +398,11 @@ func (s *Store) ListIssues(ctx context.Context, find *FindIssueMessage) ([]*Issu
+ 	}
+ 
+ 	if len(find.OrderByKeys) > 0 && orderByClause == "ORDER BY issue.id DESC" {
+-		parts := make([]string, 0, len(find.OrderByKeys)+1)
+-		for _, v := range find.OrderByKeys {
+-			parts = append(parts, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		parts = append(parts, "issue.id DESC")
+-		orderByClause = fmt.Sprintf("ORDER BY %s", strings.Join(parts, ", "))
++		orderByClause = buildStableOrderByClause(
++			find.OrderByKeys,
++			nil,
++			[]*OrderByKey{{Key: "issue.id"}},
++		)
+ 	}
+ 
+ 	q := qb.Q().Space(`
+diff --git a/backend/store/issue_comment.go b/backend/store/issue_comment.go
+index ae9200d7..a0c17b9a 100644
+--- a/backend/store/issue_comment.go
++++ b/backend/store/issue_comment.go
+@@ -74,7 +74,7 @@ func (s *Store) ListIssueComment(ctx context.Context, find *FindIssueCommentMess
+ 		q.And("issue_id = ?", *v)
+ 	}
+ 
+-	q.Space("ORDER BY created_at ASC")
++	q.Space("ORDER BY created_at ASC, resource_id ASC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/principal.go b/backend/store/principal.go
+index 96f3365b..12c4a44c 100644
+--- a/backend/store/principal.go
++++ b/backend/store/principal.go
+@@ -271,7 +271,7 @@ func listUserImpl(ctx context.Context, txn *sql.Tx, find *FindUserMessage) ([]*U
+ 			principal.created_at
+ 		FROM ?
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		ORDER BY created_at ASC, principal.email ASC
+ 	`, from, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/backend/store/project.go b/backend/store/project.go
+index 0ed6cee7..c0ca35cc 100644
+--- a/backend/store/project.go
++++ b/backend/store/project.go
+@@ -122,15 +122,11 @@ func (s *Store) ListProjects(ctx context.Context, find *FindProjectMessage) ([]*
+ 		q.And("deleted = ?", false)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY project.resource_id")
+-	}
++	q.Space(buildStableOrderByClause(
++		find.OrderByKeys,
++		[]*OrderByKey{{Key: "project.resource_id", SortOrder: ASC}},
++		[]*OrderByKey{{Key: "project.resource_id"}},
++	))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/release.go b/backend/store/release.go
+index 821cbeab..4fd7387c 100644
+--- a/backend/store/release.go
++++ b/backend/store/release.go
+@@ -163,7 +163,7 @@ func (s *Store) ListReleases(ctx context.Context, find *FindReleaseMessage) ([]*
+ 		q.And("deleted = ?", false)
+ 	}
+ 
+-	q.Space("ORDER BY release.created_at DESC")
++	q.Space("ORDER BY release.created_at DESC, release.project DESC, release.release_id DESC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/service_account.go b/backend/store/service_account.go
+index 8126129e..af64d43d 100644
+--- a/backend/store/service_account.go
++++ b/backend/store/service_account.go
+@@ -127,7 +127,7 @@ func (s *Store) ListServiceAccounts(ctx context.Context, find *FindServiceAccoun
+ 			project
+ 		FROM service_account
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		ORDER BY created_at ASC, email ASC
+ 	`, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/backend/store/workload_identity.go b/backend/store/workload_identity.go
+index 7ef6aeac..25e8c054 100644
+--- a/backend/store/workload_identity.go
++++ b/backend/store/workload_identity.go
+@@ -138,7 +138,7 @@ func (s *Store) ListWorkloadIdentities(ctx context.Context, find *FindWorkloadId
+ 			config
+ 		FROM workload_identity
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		ORDER BY created_at ASC, email ASC
+ 	`, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/scripts/repro_issue_pagination.sh b/scripts/repro_issue_pagination.sh
+new file mode 100755
+index 00000000..53dbb26e
+--- /dev/null
++++ b/scripts/repro_issue_pagination.sh
+@@ -0,0 +1,3 @@
++#!/usr/bin/env bash
++set -euo pipefail
++go test ./backend/store ./backend/api/v1 -run "TestBuildStableOrderByClause|TestPaginateConvertedIssuesWithPostFilter"

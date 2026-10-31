@@ -1,0 +1,214 @@
+diff --git a/backend/store/access_grant.go b/backend/store/access_grant.go
+index d6a1dc99..4f654461 100644
+--- a/backend/store/access_grant.go
++++ b/backend/store/access_grant.go
+@@ -137,14 +137,19 @@ func (s *Store) ListAccessGrants(ctx context.Context, find *FindAccessGrantMessa
+ 		q.And("creator = ?", *v)
+ 	}
+ 
++	// Append the primary key (id) as the final tiebreaker so the total ordering
++	// is deterministic across queries; otherwise rows sharing created_at can be
++	// ordered differently between pages, making OFFSET/LIMIT paging drop or repeat
++	// rows.
+ 	if len(find.OrderByKeys) > 0 {
+ 		orderBy := []string{}
+ 		for _, v := range find.OrderByKeys {
+ 			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+ 		}
++		orderBy = append(orderBy, fmt.Sprintf("id %s", find.OrderByKeys[len(find.OrderByKeys)-1].SortOrder.String()))
+ 		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+ 	} else {
+-		q.Space("ORDER BY created_at DESC")
++		q.Space("ORDER BY created_at DESC, id DESC")
+ 	}
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/audit_log.go b/backend/store/audit_log.go
+index 41a534fe..2342ccb4 100644
+--- a/backend/store/audit_log.go
++++ b/backend/store/audit_log.go
+@@ -72,14 +72,20 @@ func (s *Store) SearchAuditLogs(ctx context.Context, find *AuditLogFind) ([]*Aud
+ 		q.And("payload->>'parent' = ?", *v)
+ 	}
+ 
++	// Append the primary key (resource_id) as the final tiebreaker so the total
++	// ordering is deterministic. Without it, rows that compare equal under the
++	// requested ordering (e.g. the same created_at) can be returned in a different
++	// relative order across queries, which makes OFFSET/LIMIT paging drop or repeat
++	// rows.
+ 	if len(find.OrderByKeys) > 0 {
+ 		orderBy := []string{}
+ 		for _, v := range find.OrderByKeys {
+ 			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+ 		}
++		orderBy = append(orderBy, fmt.Sprintf("resource_id %s", find.OrderByKeys[len(find.OrderByKeys)-1].SortOrder.String()))
+ 		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+ 	} else {
+-		q.Space("ORDER BY created_at DESC")
++		q.Space("ORDER BY created_at DESC, resource_id DESC")
+ 	}
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/database.go b/backend/store/database.go
+index 1aea384f..0200d417 100644
+--- a/backend/store/database.go
++++ b/backend/store/database.go
+@@ -192,11 +192,17 @@ func (s *Store) ListDatabases(ctx context.Context, find *FindDatabaseMessage) ([
+ 		WHERE ?
+ 	`, from, where)
+ 
++	// Append the unique key (db.instance, db.name) as the final tiebreaker so the
++	// ordering is a total order. Without it, databases that compare equal under the
++	// requested ordering can be returned in a different relative order across
++	// queries, which makes OFFSET/LIMIT paging drop or repeat rows.
+ 	if len(find.OrderByKeys) > 0 {
+ 		orderBy := []string{}
+ 		for _, v := range find.OrderByKeys {
+ 			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+ 		}
++		lastSortOrder := find.OrderByKeys[len(find.OrderByKeys)-1].SortOrder.String()
++		orderBy = append(orderBy, fmt.Sprintf("db.instance %s", lastSortOrder), fmt.Sprintf("db.name %s", lastSortOrder))
+ 		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+ 	} else {
+ 		q.Space("ORDER BY db.project, db.instance, db.name")
+diff --git a/backend/store/group.go b/backend/store/group.go
+index e4a39e0e..5dfbeeca 100644
+--- a/backend/store/group.go
++++ b/backend/store/group.go
+@@ -141,7 +141,9 @@ func (s *Store) ListGroups(ctx context.Context, find *FindGroupMessage) ([]*Grou
+ 			user_group.payload
+ 		FROM ?
+ 		WHERE ?
+-		ORDER BY email
++		-- Primary key (id) as the final tiebreaker so OFFSET/LIMIT paging is stable;
++		-- email is nullable and only unique per workspace, so it is not a total order.
++		ORDER BY email, id
+ 	`, from, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/backend/store/instance.go b/backend/store/instance.go
+index 3219905f..4b257c7a 100644
+--- a/backend/store/instance.go
++++ b/backend/store/instance.go
+@@ -137,11 +137,14 @@ func (s *Store) ListInstances(ctx context.Context, find *FindInstanceMessage) ([
+ 		WHERE ?
+ 	`, where)
+ 
++	// Append the primary key (resource_id) as the final tiebreaker so the ordering
++	// is a total order and OFFSET/LIMIT paging is stable across pages.
+ 	if len(find.OrderByKeys) > 0 {
+ 		orderBy := []string{}
+ 		for _, v := range find.OrderByKeys {
+ 			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+ 		}
++		orderBy = append(orderBy, fmt.Sprintf("resource_id %s", find.OrderByKeys[len(find.OrderByKeys)-1].SortOrder.String()))
+ 		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+ 	} else {
+ 		q.Space("ORDER BY resource_id ASC")
+diff --git a/backend/store/issue_comment.go b/backend/store/issue_comment.go
+index ae9200d7..dbda5879 100644
+--- a/backend/store/issue_comment.go
++++ b/backend/store/issue_comment.go
+@@ -74,7 +74,9 @@ func (s *Store) ListIssueComment(ctx context.Context, find *FindIssueCommentMess
+ 		q.And("issue_id = ?", *v)
+ 	}
+ 
+-	q.Space("ORDER BY created_at ASC")
++	// Primary key (resource_id) as the final tiebreaker so OFFSET/LIMIT paging is
++	// stable; comments can share the same created_at.
++	q.Space("ORDER BY created_at ASC, resource_id ASC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/principal.go b/backend/store/principal.go
+index 96f3365b..9eb3d194 100644
+--- a/backend/store/principal.go
++++ b/backend/store/principal.go
+@@ -271,7 +271,8 @@ func listUserImpl(ctx context.Context, txn *sql.Tx, find *FindUserMessage) ([]*U
+ 			principal.created_at
+ 		FROM ?
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		-- Primary key (id) as the final tiebreaker so OFFSET/LIMIT paging is stable across pages.
++		ORDER BY created_at ASC, id ASC
+ 	`, from, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/backend/store/project.go b/backend/store/project.go
+index 0ed6cee7..89234c03 100644
+--- a/backend/store/project.go
++++ b/backend/store/project.go
+@@ -122,11 +122,14 @@ func (s *Store) ListProjects(ctx context.Context, find *FindProjectMessage) ([]*
+ 		q.And("deleted = ?", false)
+ 	}
+ 
++	// Append the primary key (project.resource_id) as the final tiebreaker so the
++	// ordering is a total order and OFFSET/LIMIT paging is stable across pages.
+ 	if len(find.OrderByKeys) > 0 {
+ 		orderBy := []string{}
+ 		for _, v := range find.OrderByKeys {
+ 			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+ 		}
++		orderBy = append(orderBy, fmt.Sprintf("project.resource_id %s", find.OrderByKeys[len(find.OrderByKeys)-1].SortOrder.String()))
+ 		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+ 	} else {
+ 		q.Space("ORDER BY project.resource_id")
+diff --git a/backend/store/release.go b/backend/store/release.go
+index 821cbeab..89d37e32 100644
+--- a/backend/store/release.go
++++ b/backend/store/release.go
+@@ -163,7 +163,10 @@ func (s *Store) ListReleases(ctx context.Context, find *FindReleaseMessage) ([]*
+ 		q.And("deleted = ?", false)
+ 	}
+ 
+-	q.Space("ORDER BY release.created_at DESC")
++	// Append the primary key (project, train, iteration) as the final tiebreaker so
++	// the ordering is deterministic; otherwise releases sharing created_at can be
++	// ordered differently between pages, making OFFSET/LIMIT paging drop or repeat rows.
++	q.Space("ORDER BY release.created_at DESC, release.project DESC, release.train DESC, release.iteration DESC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/revision.go b/backend/store/revision.go
+index c4a3ca9e..173b7524 100644
+--- a/backend/store/revision.go
++++ b/backend/store/revision.go
+@@ -76,7 +76,9 @@ func (s *Store) ListRevisions(ctx context.Context, find *FindRevisionMessage) ([
+ 	if !find.ShowDeleted {
+ 		q.And("deleted_at IS NULL")
+ 	}
+-	q.Space("ORDER BY version DESC")
++	// Primary key (resource_id) as the final tiebreaker so OFFSET/LIMIT paging is
++	// stable; multiple revisions can share the same version string.
++	q.Space("ORDER BY version DESC, resource_id DESC")
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/service_account.go b/backend/store/service_account.go
+index 8126129e..2a11b750 100644
+--- a/backend/store/service_account.go
++++ b/backend/store/service_account.go
+@@ -127,7 +127,8 @@ func (s *Store) ListServiceAccounts(ctx context.Context, find *FindServiceAccoun
+ 			project
+ 		FROM service_account
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		-- Primary key (email) as the final tiebreaker so OFFSET/LIMIT paging is stable.
++		ORDER BY created_at ASC, email ASC
+ 	`, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/backend/store/workload_identity.go b/backend/store/workload_identity.go
+index 7ef6aeac..1dcf4c83 100644
+--- a/backend/store/workload_identity.go
++++ b/backend/store/workload_identity.go
+@@ -138,7 +138,8 @@ func (s *Store) ListWorkloadIdentities(ctx context.Context, find *FindWorkloadId
+ 			config
+ 		FROM workload_identity
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		-- Primary key (email) as the final tiebreaker so OFFSET/LIMIT paging is stable.
++		ORDER BY created_at ASC, email ASC
+ 	`, where)
+ 
+ 	if v := find.Limit; v != nil {

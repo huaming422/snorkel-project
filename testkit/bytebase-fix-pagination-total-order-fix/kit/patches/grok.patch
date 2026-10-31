@@ -1,0 +1,524 @@
+diff --git a/backend/store/access_grant.go b/backend/store/access_grant.go
+index d6a1dc99..0fd29c79 100644
+--- a/backend/store/access_grant.go
++++ b/backend/store/access_grant.go
+@@ -2,7 +2,6 @@ package store
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"strings"
+ 	"time"
+ 
+@@ -137,15 +136,11 @@ func (s *Store) ListAccessGrants(ctx context.Context, find *FindAccessGrantMessa
+ 		q.And("creator = ?", *v)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY created_at DESC")
++	keys := find.OrderByKeys
++	if len(keys) == 0 {
++		keys = []*OrderByKey{{Key: "created_at", SortOrder: DESC}}
+ 	}
++	q.Space(stableOrderBy(keys, &OrderByKey{Key: "id", SortOrder: DESC}))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/audit_log.go b/backend/store/audit_log.go
+index 41a534fe..74a89b9d 100644
+--- a/backend/store/audit_log.go
++++ b/backend/store/audit_log.go
+@@ -3,7 +3,6 @@ package store
+ import (
+ 	"context"
+ 	"fmt"
+-	"strings"
+ 	"time"
+ 
+ 	"github.com/google/cel-go/cel"
+@@ -72,15 +71,11 @@ func (s *Store) SearchAuditLogs(ctx context.Context, find *AuditLogFind) ([]*Aud
+ 		q.And("payload->>'parent' = ?", *v)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY created_at DESC")
++	keys := find.OrderByKeys
++	if len(keys) == 0 {
++		keys = []*OrderByKey{{Key: "created_at", SortOrder: DESC}}
+ 	}
++	q.Space(stableOrderBy(keys, &OrderByKey{Key: "resource_id", SortOrder: DESC}))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/common.go b/backend/store/common.go
+index 9163e3ce..f5ab9542 100644
+--- a/backend/store/common.go
++++ b/backend/store/common.go
+@@ -1,6 +1,7 @@
+ package store
+ 
+ import (
++	"fmt"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -36,6 +37,32 @@ type OrderByKey struct {
+ 	SortOrder SortOrder
+ }
+ 
++// stableOrderBy builds an ORDER BY clause from the requested sort keys and a
++// set of unique tiebreaker columns. LIMIT/OFFSET pagination is only stable
++// when the full ORDER BY uniquely identifies every row: without the
++// tiebreakers, rows that share the same sort values can swap places between
++// pages, producing duplicates and gaps. Tiebreakers already present in keys
++// are skipped. When keys is empty, the tiebreakers alone form the default
++// order.
++func stableOrderBy(keys []*OrderByKey, tiebreakers ...*OrderByKey) string {
++	parts := make([]string, 0, len(keys)+len(tiebreakers))
++	seen := make(map[string]bool, len(keys)+len(tiebreakers))
++	appendKey := func(k *OrderByKey) {
++		if k == nil || k.Key == "" || seen[k.Key] {
++			return
++		}
++		parts = append(parts, fmt.Sprintf("%s %s", k.Key, k.SortOrder.String()))
++		seen[k.Key] = true
++	}
++	for _, k := range keys {
++		appendKey(k)
++	}
++	for _, k := range tiebreakers {
++		appendKey(k)
++	}
++	return "ORDER BY " + strings.Join(parts, ", ")
++}
++
+ // getOrderByKeys parses an AIP-132 order_by string against a whitelist
+ // mapping API field names to SQL columns. Strict where parseOrderBy is not:
+ // every comma-separated entry must be a whitelisted field with an optional
+diff --git a/backend/store/common_test.go b/backend/store/common_test.go
+index b3a93ccc..729d67a5 100644
+--- a/backend/store/common_test.go
++++ b/backend/store/common_test.go
+@@ -55,3 +55,50 @@ func TestParseOrderBy(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestStableOrderBy(t *testing.T) {
++	// Issue ids are only unique per project. Without project as a
++	// tiebreaker, cross-project LIMIT/OFFSET pages are non-deterministic.
++	issueTiebreakers := []*OrderByKey{
++		{Key: "issue.id", SortOrder: DESC},
++		{Key: "issue.project", SortOrder: ASC},
++	}
++
++	t.Run("default most-recent-first", func(t *testing.T) {
++		got := stableOrderBy(nil, issueTiebreakers...)
++		require.Equal(t, "ORDER BY issue.id DESC, issue.project ASC", got)
++	})
++
++	t.Run("caller order_by with unique tiebreakers", func(t *testing.T) {
++		got := stableOrderBy(
++			[]*OrderByKey{{Key: "issue.updated_at", SortOrder: DESC}},
++			issueTiebreakers...,
++		)
++		require.Equal(t, "ORDER BY issue.updated_at DESC, issue.id DESC, issue.project ASC", got)
++	})
++
++	t.Run("search relevance keeps unique tiebreakers", func(t *testing.T) {
++		got := stableOrderBy(
++			[]*OrderByKey{{Key: "ts_rank(issue.ts_vector, query)", SortOrder: DESC}},
++			issueTiebreakers...,
++		)
++		require.Equal(t, "ORDER BY ts_rank(issue.ts_vector, query) DESC, issue.id DESC, issue.project ASC", got)
++	})
++
++	t.Run("skips tiebreaker already present in keys", func(t *testing.T) {
++		got := stableOrderBy(
++			[]*OrderByKey{{Key: "issue.id", SortOrder: ASC}},
++			issueTiebreakers...,
++		)
++		// id already requested (ASC); project still appended for uniqueness.
++		require.Equal(t, "ORDER BY issue.id ASC, issue.project ASC", got)
++	})
++
++	t.Run("plan composite primary key", func(t *testing.T) {
++		got := stableOrderBy(nil,
++			&OrderByKey{Key: "id", SortOrder: DESC},
++			&OrderByKey{Key: "project", SortOrder: ASC},
++		)
++		require.Equal(t, "ORDER BY id DESC, project ASC", got)
++	})
++}
+diff --git a/backend/store/database.go b/backend/store/database.go
+index 1aea384f..7710b40e 100644
+--- a/backend/store/database.go
++++ b/backend/store/database.go
+@@ -192,15 +192,16 @@ func (s *Store) ListDatabases(ctx context.Context, find *FindDatabaseMessage) ([
+ 		WHERE ?
+ 	`, from, where)
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
++	keys := find.OrderByKeys
++	if len(keys) == 0 {
++		keys = []*OrderByKey{
++			{Key: "db.project", SortOrder: ASC},
++			{Key: "db.instance", SortOrder: ASC},
++			{Key: "db.name", SortOrder: ASC},
+ 		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY db.project, db.instance, db.name")
+ 	}
++	// PK is (instance, name); always append so custom orders stay stable.
++	q.Space(stableOrderBy(keys, &OrderByKey{Key: "db.instance", SortOrder: ASC}, &OrderByKey{Key: "db.name", SortOrder: ASC}))
+ 
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/group.go b/backend/store/group.go
+index e4a39e0e..c531d992 100644
+--- a/backend/store/group.go
++++ b/backend/store/group.go
+@@ -141,7 +141,7 @@ func (s *Store) ListGroups(ctx context.Context, find *FindGroupMessage) ([]*Grou
+ 			user_group.payload
+ 		FROM ?
+ 		WHERE ?
+-		ORDER BY email
++		ORDER BY email ASC, id ASC
+ 	`, from, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/backend/store/instance.go b/backend/store/instance.go
+index 3219905f..f3468b3d 100644
+--- a/backend/store/instance.go
++++ b/backend/store/instance.go
+@@ -137,15 +137,11 @@ func (s *Store) ListInstances(ctx context.Context, find *FindInstanceMessage) ([
+ 		WHERE ?
+ 	`, where)
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY resource_id ASC")
++	keys := find.OrderByKeys
++	if len(keys) == 0 {
++		keys = []*OrderByKey{{Key: "resource_id", SortOrder: ASC}}
+ 	}
++	q.Space(stableOrderBy(keys, &OrderByKey{Key: "resource_id", SortOrder: ASC}))
+ 
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+diff --git a/backend/store/issue.go b/backend/store/issue.go
+index 27343615..a7bdb1af 100644
+--- a/backend/store/issue.go
++++ b/backend/store/issue.go
+@@ -320,7 +320,15 @@ func updateIssue(ctx context.Context, executor issueUpdateExecutor, projectID st
+ 
+ // ListIssues returns the list of issues by find query.
+ func (s *Store) ListIssues(ctx context.Context, find *FindIssueMessage) ([]*IssueMessage, error) {
+-	orderByClause := "ORDER BY issue.id DESC"
++	// Issue ids are unique per project only (PRIMARY KEY (project, id)), so
++	// project must ride along as a tiebreaker. Without it, cross-project
++	// lists (My Issues) are non-deterministic under LIMIT/OFFSET whenever
++	// two projects share the same issue id.
++	issueTiebreakers := []*OrderByKey{
++		{Key: "issue.id", SortOrder: DESC},
++		{Key: "issue.project", SortOrder: ASC},
++	}
++	var orderKeys []*OrderByKey
+ 	from := qb.Q().Space("issue")
+ 	where := qb.Q()
+ 
+@@ -371,7 +379,7 @@ func (s *Store) ListIssues(ctx context.Context, find *FindIssueMessage) ([]*Issu
+ 		if tsQuery := getTSQuery(*v); tsQuery != "" {
+ 			from.Space("LEFT JOIN CAST(? AS tsquery) AS query ON TRUE", tsQuery)
+ 			searchCondition.Or("issue.ts_vector @@ query")
+-			orderByClause = "ORDER BY ts_rank(issue.ts_vector, query) DESC, issue.id DESC"
++			orderKeys = []*OrderByKey{{Key: "ts_rank(issue.ts_vector, query)", SortOrder: DESC}}
+ 		}
+ 		searchCondition.Or("issue.name ILIKE ?", "%"+*v+"%")
+ 		where.And("(?)", searchCondition)
+@@ -397,14 +405,11 @@ func (s *Store) ListIssues(ctx context.Context, find *FindIssueMessage) ([]*Issu
+ 		where.And("COALESCE(issue.payload->>'draft', 'false') = 'false'")
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 && orderByClause == "ORDER BY issue.id DESC" {
+-		parts := make([]string, 0, len(find.OrderByKeys)+1)
+-		for _, v := range find.OrderByKeys {
+-			parts = append(parts, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		parts = append(parts, "issue.id DESC")
+-		orderByClause = fmt.Sprintf("ORDER BY %s", strings.Join(parts, ", "))
++	// Relevance order (set above) wins over a caller-supplied order_by.
++	if len(orderKeys) == 0 && len(find.OrderByKeys) > 0 {
++		orderKeys = find.OrderByKeys
+ 	}
++	orderByClause := stableOrderBy(orderKeys, issueTiebreakers...)
+ 
+ 	q := qb.Q().Space(`
+ 		SELECT
+diff --git a/backend/store/issue_comment.go b/backend/store/issue_comment.go
+index ae9200d7..6c54b80f 100644
+--- a/backend/store/issue_comment.go
++++ b/backend/store/issue_comment.go
+@@ -74,7 +74,7 @@ func (s *Store) ListIssueComment(ctx context.Context, find *FindIssueCommentMess
+ 		q.And("issue_id = ?", *v)
+ 	}
+ 
+-	q.Space("ORDER BY created_at ASC")
++	q.Space(stableOrderBy(nil, &OrderByKey{Key: "created_at", SortOrder: ASC}, &OrderByKey{Key: "resource_id", SortOrder: ASC}))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/plan.go b/backend/store/plan.go
+index 776973ef..5d73372c 100644
+--- a/backend/store/plan.go
++++ b/backend/store/plan.go
+@@ -182,7 +182,7 @@ func (s *Store) ListPlans(ctx context.Context, find *FindPlanMessage) ([]*PlanMe
+ 		)`)
+ 	}
+ 
+-	q.Space("ORDER BY id DESC")
++	q.Space(stableOrderBy(nil, &OrderByKey{Key: "id", SortOrder: DESC}, &OrderByKey{Key: "project", SortOrder: ASC}))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/principal.go b/backend/store/principal.go
+index 96f3365b..c26e1933 100644
+--- a/backend/store/principal.go
++++ b/backend/store/principal.go
+@@ -271,7 +271,7 @@ func listUserImpl(ctx context.Context, txn *sql.Tx, find *FindUserMessage) ([]*U
+ 			principal.created_at
+ 		FROM ?
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		ORDER BY created_at ASC, principal.id ASC
+ 	`, from, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/backend/store/project.go b/backend/store/project.go
+index 0ed6cee7..94f912f1 100644
+--- a/backend/store/project.go
++++ b/backend/store/project.go
+@@ -122,15 +122,11 @@ func (s *Store) ListProjects(ctx context.Context, find *FindProjectMessage) ([]*
+ 		q.And("deleted = ?", false)
+ 	}
+ 
+-	if len(find.OrderByKeys) > 0 {
+-		orderBy := []string{}
+-		for _, v := range find.OrderByKeys {
+-			orderBy = append(orderBy, fmt.Sprintf("%s %s", v.Key, v.SortOrder.String()))
+-		}
+-		q.Space(fmt.Sprintf("ORDER BY %s", strings.Join(orderBy, ", ")))
+-	} else {
+-		q.Space("ORDER BY project.resource_id")
++	keys := find.OrderByKeys
++	if len(keys) == 0 {
++		keys = []*OrderByKey{{Key: "project.resource_id", SortOrder: ASC}}
+ 	}
++	q.Space(stableOrderBy(keys, &OrderByKey{Key: "project.resource_id", SortOrder: ASC}))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/release.go b/backend/store/release.go
+index 821cbeab..26257fb9 100644
+--- a/backend/store/release.go
++++ b/backend/store/release.go
+@@ -163,7 +163,7 @@ func (s *Store) ListReleases(ctx context.Context, find *FindReleaseMessage) ([]*
+ 		q.And("deleted = ?", false)
+ 	}
+ 
+-	q.Space("ORDER BY release.created_at DESC")
++	q.Space(stableOrderBy(nil, &OrderByKey{Key: "release.created_at", SortOrder: DESC}, &OrderByKey{Key: "release.project", SortOrder: ASC}, &OrderByKey{Key: "release.train", SortOrder: ASC}, &OrderByKey{Key: "release.iteration", SortOrder: DESC}))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/revision.go b/backend/store/revision.go
+index c4a3ca9e..06ee6886 100644
+--- a/backend/store/revision.go
++++ b/backend/store/revision.go
+@@ -76,7 +76,7 @@ func (s *Store) ListRevisions(ctx context.Context, find *FindRevisionMessage) ([
+ 	if !find.ShowDeleted {
+ 		q.And("deleted_at IS NULL")
+ 	}
+-	q.Space("ORDER BY version DESC")
++	q.Space(stableOrderBy(nil, &OrderByKey{Key: "version", SortOrder: DESC}, &OrderByKey{Key: "resource_id", SortOrder: DESC}))
+ 	if v := find.Limit; v != nil {
+ 		q.Space("LIMIT ?", *v)
+ 	}
+diff --git a/backend/store/service_account.go b/backend/store/service_account.go
+index 8126129e..af64d43d 100644
+--- a/backend/store/service_account.go
++++ b/backend/store/service_account.go
+@@ -127,7 +127,7 @@ func (s *Store) ListServiceAccounts(ctx context.Context, find *FindServiceAccoun
+ 			project
+ 		FROM service_account
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		ORDER BY created_at ASC, email ASC
+ 	`, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/backend/store/workload_identity.go b/backend/store/workload_identity.go
+index 7ef6aeac..25e8c054 100644
+--- a/backend/store/workload_identity.go
++++ b/backend/store/workload_identity.go
+@@ -138,7 +138,7 @@ func (s *Store) ListWorkloadIdentities(ctx context.Context, find *FindWorkloadId
+ 			config
+ 		FROM workload_identity
+ 		WHERE ?
+-		ORDER BY created_at ASC
++		ORDER BY created_at ASC, email ASC
+ 	`, where)
+ 
+ 	if v := find.Limit; v != nil {
+diff --git a/scripts/repro_unstable_pagination.go b/scripts/repro_unstable_pagination.go
+new file mode 100644
+index 00000000..46c06170
+--- /dev/null
++++ b/scripts/repro_unstable_pagination.go
+@@ -0,0 +1,125 @@
++// Reproduction of unstable LIMIT/OFFSET pagination when ORDER BY is not unique.
++//
++// Issue ids are unique per project only (PRIMARY KEY (project, id)). Ordering
++// cross-project lists by id alone leaves ties; walking pages with OFFSET then
++// drops and repeats rows once a page boundary splits a tied group. Adding the
++// rest of the primary key as a tiebreaker makes the order total and pages
++// stable.
++//
++// Run: go run ./scripts/repro_unstable_pagination.go
++package main
++
++import (
++	"fmt"
++	"os"
++	"sort"
++)
++
++type issue struct {
++	project string
++	id      int
++}
++
++func page(rows []issue, limit, offset int) []issue {
++	if offset >= len(rows) {
++		return nil
++	}
++	end := offset + limit
++	if end > len(rows) {
++		end = len(rows)
++	}
++	out := make([]issue, end-offset)
++	copy(out, rows[offset:end])
++	return out
++}
++
++// sortByID sorts by id DESC. When reverseTies is set, tied projects flip —
++// the same non-determinism PostgreSQL is free to use when ORDER BY is not unique.
++func sortByID(rows []issue, reverseTies bool) []issue {
++	out := append([]issue(nil), rows...)
++	sort.SliceStable(out, func(i, j int) bool {
++		if out[i].id != out[j].id {
++			return out[i].id > out[j].id
++		}
++		if reverseTies {
++			return out[i].project > out[j].project
++		}
++		return out[i].project < out[j].project
++	})
++	return out
++}
++
++func sortStable(rows []issue) []issue {
++	out := append([]issue(nil), rows...)
++	sort.SliceStable(out, func(i, j int) bool {
++		if out[i].id != out[j].id {
++			return out[i].id > out[j].id
++		}
++		return out[i].project < out[j].project
++	})
++	return out
++}
++
++func keyOf(r issue) string { return fmt.Sprintf("%s#%d", r.project, r.id) }
++
++// walkPages re-fetches and re-sorts on every page, like independent SQL queries.
++func walkPages(label string, sortFn func(int, []issue) []issue, all []issue, pageSize int) map[string]int {
++	seen := map[string]int{}
++	for offset, pageNum := 0, 0; offset < len(all); offset, pageNum = offset+pageSize, pageNum+1 {
++		ordered := sortFn(pageNum, all)
++		chunk := page(ordered, pageSize, offset)
++		fmt.Printf("  %s page %d (offset %d):", label, pageNum, offset)
++		for _, r := range chunk {
++			seen[keyOf(r)]++
++			fmt.Printf(" %s", keyOf(r))
++		}
++		fmt.Println()
++	}
++	return seen
++}
++
++func exactOnce(all []issue, seen map[string]int) bool {
++	if len(seen) != len(all) {
++		return false
++	}
++	for _, r := range all {
++		if seen[keyOf(r)] != 1 {
++			return false
++		}
++	}
++	return true
++}
++
++func main() {
++	// Three projects × ids 1..3. Page size 4 splits tied id-groups across pages.
++	all := []issue{
++		{"alpha", 3}, {"beta", 3}, {"gamma", 3},
++		{"alpha", 2}, {"beta", 2}, {"gamma", 2},
++		{"alpha", 1}, {"beta", 1}, {"gamma", 1},
++	}
++	pageSize := 4
++
++	fmt.Println("UNSTABLE — ORDER BY id DESC only; tie direction flips each page:")
++	unstableSeen := walkPages("broken", func(pageNum int, rows []issue) []issue {
++		return sortByID(rows, pageNum%2 == 1)
++	}, all, pageSize)
++	unstableOK := exactOnce(all, unstableSeen)
++	fmt.Printf("  counts=%v exact-once=%v\n\n", unstableSeen, unstableOK)
++
++	fmt.Println("STABLE — ORDER BY id DESC, project ASC:")
++	stableSeen := walkPages("fixed", func(_ int, rows []issue) []issue {
++		return sortStable(rows)
++	}, all, pageSize)
++	stableOK := exactOnce(all, stableSeen)
++	fmt.Printf("  counts=%v exact-once=%v\n\n", stableSeen, stableOK)
++
++	if unstableOK {
++		fmt.Println("FAIL: expected unstable walk to drop/duplicate rows")
++		os.Exit(1)
++	}
++	if !stableOK {
++		fmt.Println("FAIL: stable walk must return every row exactly once")
++		os.Exit(1)
++	}
++	fmt.Println("repro ok: unstable drops/duplicates; stable is exact-once")
++}

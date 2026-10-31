@@ -1,0 +1,50 @@
+{
+  "files": [
+    "backend/store/access_grant.go",
+    "backend/store/audit_log.go",
+    "backend/store/changelog.go",
+    "backend/store/database.go",
+    "backend/store/group.go",
+    "backend/store/instance.go",
+    "backend/store/issue.go",
+    "backend/store/issue_comment.go",
+    "backend/store/principal.go",
+    "backend/store/project.go",
+    "backend/store/release.go",
+    "backend/store/revision.go",
+    "backend/store/service_account.go",
+    "backend/store/workload_identity.go"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "paging_through_an_affected_store_list_over_a_static_dataset",
+      "description": "Paging through an affected store list over a static dataset in which many rows\ntie on the displayed ordering returns every row exactly once across the full\nset of pages \u2014 no omissions and no duplicates. Pre-fix, tied rows reorder\nbetween page requests under LIMIT/OFFSET so paging drops and repeats rows.\n"
+    },
+    {
+      "name": "paging_the_issues_list_across_multiple_projects_\u2014_where_issu",
+      "description": "Paging the issues list across multiple projects \u2014 where issue identifiers\ncollide between projects because they are assigned per project \u2014 returns every\nissue exactly once. This is the headline cross-project symptom.\n"
+    },
+    {
+      "name": "a_batch_of_issue_comments_created_together_is_read_back_by_t",
+      "description": "A batch of issue comments created together is read back by the comment list in\nthe order it was inserted. Pre-fix, a batch shares one transaction timestamp,\nso after any read-side tiebreak the order falls back to a random UUID and the\nbatch is scrambled.\n"
+    },
+    {
+      "name": "the_fix_addresses_the_defect_as_a_class_across_the_store's_o",
+      "description": "The fix addresses the defect as a class across the store's offset-paginated\nlist functions, not only the single list named in the symptom report.\n"
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "a_caller-supplied_explicit_ordering_is_still_honored:_the_fi",
+      "description": "A caller-supplied explicit ordering is still honored: the fix only breaks ties\nand never overrides the requested lead sort.\n"
+    },
+    {
+      "name": "lists_that_were_already_total_are_not_needlessly_rewritten,",
+      "description": "Lists that were already total are not needlessly rewritten, and the change\ndoes not alter the leading sort semantics any caller depends on (only ties are\nbroken). Guards against a spurious broad rewrite.\n"
+    },
+    {
+      "name": "each_appended_tiebreak_is_unique_under_its_query's_scope_and",
+      "description": "Each appended tiebreak is unique under its query's scope and its sort\ndirection matches the leading key and an existing index, so ordering is total\nwithout defeating the index that keeps paging cheap.\n"
+    }
+  ]
+}

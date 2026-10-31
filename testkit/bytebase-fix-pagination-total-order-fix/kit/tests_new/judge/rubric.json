@@ -1,0 +1,18 @@
+{
+  "files": [],
+  "fail_to_pass": [],
+  "pass_to_pass": [
+    {
+      "name": "stable_lists_left_alone",
+      "description": "Lists that already paged with every row exactly once before the change are not rewritten, so the diff touches only lists that could skip or repeat rows."
+    },
+    {
+      "name": "ordering_reason_explained_in_place",
+      "description": "Each list whose ordering the change touches has a short comment next to it explaining the change, in the comment style of the surrounding code."
+    },
+    {
+      "name": "regression_tests_for_paging",
+      "description": "The change adds or updates repository tests that page through at least one affected list over rows that look the same under its sort order and check that every row comes back exactly once."
+    }
+  ]
+}

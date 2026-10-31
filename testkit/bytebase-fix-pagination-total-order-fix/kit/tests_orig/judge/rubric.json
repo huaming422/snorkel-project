@@ -1,0 +1,34 @@
+{
+  "files": [
+    "backend/store/access_grant.go",
+    "backend/store/audit_log.go",
+    "backend/store/changelog.go",
+    "backend/store/database.go",
+    "backend/store/group.go",
+    "backend/store/instance.go",
+    "backend/store/issue.go",
+    "backend/store/issue_comment.go",
+    "backend/store/principal.go",
+    "backend/store/project.go",
+    "backend/store/release.go",
+    "backend/store/revision.go",
+    "backend/store/service_account.go",
+    "backend/store/workload_identity.go"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "class_sweep_coverage",
+      "description": "The fix treats the unstable-pagination defect as a class across the offset-paginated list functions in backend/store/, not just the single issues list named in the symptom report. A correct solution makes the SQL ordering total (ends on a column or column set that is unique within the query's scope) for every paginated list whose default ordering keyed only on a non-unique column (e.g. a created_at timestamp that defaults to now(), a title, a per-project counter). It is NOT enough to fix only ListIssues: lists such as the service-account, workload-identity, audit-log, changelog, database, instance, project, group, principal/user, access-grant, release, and revision listings were each non-total before and must each be made total. Any tiebreak column set that is provably unique under the query scope is acceptable (primary key, or an equivalently unique natural key such as a resource_id or email); the specific column chosen per list does not matter. Judge from the agent's diff: does the total-ordering change reach the broad set of previously-non-total paginated lists, or only the headline one?"
+    },
+    {
+      "name": "tiebreak_direction_sound",
+      "description": "Each appended tiebreak is unique under its query's own scope and its sort direction is consistent with the leading key, so the ordering becomes total without defeating the index that keeps paging cheap. 'Scope-unique' means the tiebreak column(s) cannot repeat among the rows a single query returns — a primary key or an equivalently unique column set. A tiebreak on a column that is still non-unique within scope (for example ending a cross-project issue ordering on a per-project id without also including the project) does not make the ordering total and should count against the solution. Direction should follow the leading key (e.g. a DESC lead gets a DESC tiebreak) so the composite ordering can still be served by an existing index rather than forcing an extra sort. Judge from the agent's diff: is every appended tiebreak genuinely unique within its query scope and directionally consistent with the key it follows?"
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "no_spurious_changes",
+      "description": "Lists whose pagination was already stable before the change are left alone, and the change breaks only ties — it never alters the leading sort semantics a caller depends on. Some lists are already total for subtle reasons (a mandatory scope predicate pins a unique key, or the list already appends a unique column to its ORDER BY); rewriting those is a spurious change and should count against the solution. Likewise, the primary/leading ordering of every list (its most-recent-first default, its search-relevance ordering, or a caller-supplied order_by) must be preserved: the fix appends a tiebreak after the existing lead key, it does not replace or reorder the lead key. Judge from the agent's diff: were already-correct lists needlessly rewritten, or was any list's primary ordering changed beyond appending a tie-break?"
+    }
+  ]
+}
