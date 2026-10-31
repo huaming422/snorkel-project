@@ -1,0 +1,3 @@
+FROM superset-fix-jinja-dataset-refresh:latest
+COPY kit /kit
+RUN chmod +x /kit/inner.sh && mkdir -p /tests /logs/verifier

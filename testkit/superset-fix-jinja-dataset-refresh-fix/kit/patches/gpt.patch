@@ -1,0 +1,400 @@
+diff --git a/scripts/repro_virtual_dataset_jinja_save_issue.sh b/scripts/repro_virtual_dataset_jinja_save_issue.sh
+new file mode 100755
+index 00000000..a41696c9
+--- /dev/null
++++ b/scripts/repro_virtual_dataset_jinja_save_issue.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++cd /repo/superset
++
++echo "Running backend regression for partial-success dataset save with failed column sync..."
++pytest -q tests/unit_tests/datasets/api_tests.py -k "refresh_failure_returns_partial_success"
++
++if command -v npm >/dev/null 2>&1; then
++  echo "Running frontend regression for datasource modal warning behavior..."
++  npm --prefix superset-frontend test -- --runInBand --watch=false src/components/Datasource/DatasourceModal/DatasourceModal.test.tsx -t "warning instead of a save error"
++else
++  echo "npm not available; running static frontend assertions instead..."
++  python - <<'PY'
++from pathlib import Path
++
++modal = Path('superset-frontend/src/components/Datasource/DatasourceModal/index.tsx').read_text()
++types = Path('superset-frontend/src/components/Datasource/types.ts').read_text()
++tests = Path('superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.test.tsx').read_text()
++
++assert 'column_sync_error' in modal
++assert 'The dataset was saved, but columns could not be synced: %s' in modal
++assert 'The dataset was saved, but the latest metadata could not be reloaded.' in modal
++assert 'addWarningToast' in types
++assert 'shows a warning instead of a save error when column sync fails after save' in tests
++assert 'shows a warning instead of a save error when the post-save reload fails' in tests
++print('Static frontend assertions passed.')
++PY
++fi
+diff --git a/superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.test.tsx b/superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.test.tsx
+index b5b7a1a6..bf8c6e54 100644
+--- a/superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.test.tsx
++++ b/superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.test.tsx
+@@ -46,6 +46,7 @@ const mockedProps = {
+   datasource: mockDatasource['7__table'],
+   addSuccessToast: () => {},
+   addDangerToast: () => {},
++  addWarningToast: jest.fn(),
+   onChange: () => {},
+   onHide: () => {},
+   show: true,
+@@ -316,8 +317,83 @@ describe('DatasourceModal', () => {
+       );
+     });
+   });
++  test('shows a warning instead of a save error when column sync fails after save', async () => {
++    cleanup();
++    fetchMock.clearHistory().removeRoutes();
++    fetchMock.put(SAVE_DATASOURCE_ENDPOINT, {
++      column_sync_error: 'Invalid SQL: unexpected EOF',
++    });
++    fetchMock.get(GET_DATASOURCE_ENDPOINT, { result: {} });
++    fetchMock.get(GET_DATABASE_ENDPOINT, { result: [] });
++
++    const addSuccessToast = jest.fn();
++    const addWarningToast = jest.fn();
++    const onHide = jest.fn();
++    const onDatasourceSave = jest.fn();
++
++    renderAndWait({
++      ...mockedProps,
++      addSuccessToast,
++      addWarningToast,
++      onHide,
++      onDatasourceSave,
++    });
++
++    const saveButton = screen.getByTestId('datasource-modal-save');
++    fireEvent.click(saveButton);
++    const okButton = await screen.findByRole('button', { name: 'OK' });
++    fireEvent.click(okButton);
++
++    await waitFor(() => {
++      expect(addSuccessToast).toHaveBeenCalledWith('The dataset has been saved');
++      expect(addWarningToast).toHaveBeenCalledWith(
++        'The dataset was saved, but columns could not be synced: Invalid SQL: unexpected EOF',
++      );
++      expect(onDatasourceSave).toHaveBeenCalled();
++      expect(onHide).toHaveBeenCalled();
++    });
++
++    expect(screen.queryByText('Error saving dataset')).not.toBeInTheDocument();
++  });
++
++  test('shows a warning instead of a save error when the post-save reload fails', async () => {
++    cleanup();
++    fetchMock.clearHistory().removeRoutes();
++    fetchMock.put(SAVE_DATASOURCE_ENDPOINT, {});
++    fetchMock.get(GET_DATASOURCE_ENDPOINT, 500);
++    fetchMock.get(GET_DATABASE_ENDPOINT, { result: [] });
++
++    const addSuccessToast = jest.fn();
++    const addWarningToast = jest.fn();
++    const onHide = jest.fn();
++    const onDatasourceSave = jest.fn();
++
++    renderAndWait({
++      ...mockedProps,
++      addSuccessToast,
++      addWarningToast,
++      onHide,
++      onDatasourceSave,
++    });
++
++    const saveButton = screen.getByTestId('datasource-modal-save');
++    fireEvent.click(saveButton);
++    const okButton = await screen.findByRole('button', { name: 'OK' });
++    fireEvent.click(okButton);
++
++    await waitFor(() => {
++      expect(addSuccessToast).toHaveBeenCalledWith('The dataset has been saved');
++      expect(addWarningToast).toHaveBeenCalledWith('Internal Server Error');
++      expect(onDatasourceSave).toHaveBeenCalled();
++      expect(onHide).toHaveBeenCalled();
++    });
++
++    expect(screen.queryByText('Error saving dataset')).not.toBeInTheDocument();
++  });
++
+ });
+ 
++
+ describe('buildExtraJsonObject', () => {
+   test('returns "{}" for an item with no warning and no certification', () => {
+     expect(buildExtraJsonObject({} as any)).toBe('{}');
+diff --git a/superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.useModal.test.tsx b/superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.useModal.test.tsx
+index 2610190b..a7a84b1a 100644
+--- a/superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.useModal.test.tsx
++++ b/superset-frontend/src/components/Datasource/DatasourceModal/DatasourceModal.useModal.test.tsx
+@@ -32,6 +32,7 @@ const mockedProps = {
+   datasource: mockDatasource['7__table'],
+   addSuccessToast: jest.fn(),
+   addDangerToast: jest.fn(),
++  addWarningToast: jest.fn(),
+   onChange: jest.fn(),
+   onHide: jest.fn(),
+   show: true,
+diff --git a/superset-frontend/src/components/Datasource/DatasourceModal/index.tsx b/superset-frontend/src/components/Datasource/DatasourceModal/index.tsx
+index db06d3da..015cc8b7 100644
+--- a/superset-frontend/src/components/Datasource/DatasourceModal/index.tsx
++++ b/superset-frontend/src/components/Datasource/DatasourceModal/index.tsx
+@@ -90,6 +90,7 @@ export function buildExtraJsonObject(
+ 
+ const DatasourceModal: FunctionComponent<DatasourceModalProps> = ({
+   addSuccessToast,
++  addWarningToast,
+   datasource,
+   onDatasourceSave,
+   onHide,
+@@ -194,22 +195,47 @@ const DatasourceModal: FunctionComponent<DatasourceModalProps> = ({
+     // Pull out extra fields into the extra object
+     setIsSaving(true);
+     try {
+-      await SupersetClient.put({
++      const { json: saveResponse } = await SupersetClient.put({
+         endpoint: `/api/v1/dataset/${currentDatasource.id}?override_columns=${syncColumns}`,
+         jsonPayload: buildPayload(currentDatasource),
+       });
+ 
+-      const { json } = await SupersetClient.get({
+-        endpoint: `/api/v1/dataset/${currentDatasource?.id}`,
+-      });
++      let savedDatasource = {
++        ...currentDatasource,
++        type: 'table',
++      };
++
++      try {
++        const { json } = await SupersetClient.get({
++          endpoint: `/api/v1/dataset/${currentDatasource?.id}`,
++        });
++
++        // eslint-disable-next-line no-param-reassign
++        json.result.type = 'table';
++        savedDatasource = {
++          ...json.result,
++          editors: currentDatasource.editors,
++        };
++      } catch (response) {
++        const error = await getClientErrorObject(response);
++        addWarningToast(
++          error.error ||
++            error.message ||
++            error.statusText ||
++            t('The dataset was saved, but the latest metadata could not be reloaded.'),
++        );
++      }
+ 
+       addSuccessToast(t('The dataset has been saved'));
+-      // eslint-disable-next-line no-param-reassign
+-      json.result.type = 'table';
+-      onDatasourceSave({
+-        ...json.result,
+-        editors: currentDatasource.editors,
+-      });
++      if (typeof saveResponse?.column_sync_error === 'string') {
++        addWarningToast(
++          t(
++            'The dataset was saved, but columns could not be synced: %s',
++            saveResponse.column_sync_error,
++          ),
++        );
++      }
++      onDatasourceSave(savedDatasource);
+       onHide();
+     } catch (response) {
+       setIsSaving(false);
+diff --git a/superset-frontend/src/components/Datasource/types.ts b/superset-frontend/src/components/Datasource/types.ts
+index 3d5dea5c..ebf0498e 100644
+--- a/superset-frontend/src/components/Datasource/types.ts
++++ b/superset-frontend/src/components/Datasource/types.ts
+@@ -28,6 +28,7 @@ export interface Datasource {
+ export interface DatasourceModalProps {
+   addSuccessToast: (msg: string) => void;
+   addDangerToast: (msg: string) => void;
++  addWarningToast: (msg: string) => void;
+   datasource: DatasetObject;
+   onChange: () => {};
+   onDatasourceSave: (datasource: object, errors?: Array<any>) => {};
+diff --git a/superset/datasets/api.py b/superset/datasets/api.py
+index af1ca2e6..1f4e7a04 100644
+--- a/superset/datasets/api.py
++++ b/superset/datasets/api.py
+@@ -93,7 +93,11 @@ from superset.exceptions import (
+ from superset.jinja_context import BaseTemplateProcessor, get_template_processor
+ from superset.subjects.filters import FilterRelatedSubjects, subject_type_filter
+ from superset.utils import json
+-from superset.utils.core import parse_boolean_string, sanitize_cookie_token
++from superset.utils.core import (
++    error_msg_from_exception,
++    parse_boolean_string,
++    sanitize_cookie_token,
++)
+ from superset.versioning.api_helpers import (
+     current_entity_etag_uuid,
+     current_entity_version_info,
+@@ -650,14 +654,28 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
+                 SqlaTable, changed_model.id, changed_model.uuid
+             )
+             etag_version_uuid = new_info.version_uuid
++            column_sync_error = None
+             if override_columns:
+-                RefreshDatasetCommand(pk).run()
+-                # The ETag must reflect the entity's *current live* version,
+-                # which after the refresh is the refresh's transaction —
+-                # re-read it rather than reusing the pre-refresh uuid.
+-                etag_version_uuid = current_entity_etag_uuid(
+-                    SqlaTable, changed_model.id, changed_model.uuid
+-                )
++                try:
++                    RefreshDatasetCommand(pk).run()
++                except Exception as ex:  # noqa: BLE001
++                    # The dataset update already committed successfully above.
++                    # Treat a follow-up metadata refresh failure as a partial
++                    # success so callers don't report a false save failure.
++                    logger.exception(
++                        "Error refreshing dataset during update %s: %s",
++                        self.__class__.__name__,
++                        str(ex),
++                    )
++                    column_sync_error = error_msg_from_exception(ex)
++                else:
++                    # The ETag must reflect the entity's *current live*
++                    # version, which after the refresh is the refresh's
++                    # transaction — re-read it rather than reusing the
++                    # pre-refresh uuid.
++                    etag_version_uuid = current_entity_etag_uuid(
++                        SqlaTable, changed_model.id, changed_model.uuid
++                    )
+             response = self.response(
+                 200,
+                 id=changed_model.id,
+@@ -668,6 +686,7 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
+                 new_transaction_id=new_info.transaction_id,
+                 old_version_uuid=old_info.version_uuid,
+                 new_version_uuid=new_info.version_uuid,
++                column_sync_error=column_sync_error,
+             )
+             set_version_etag(response, etag_version_uuid)
+         except DatasetNotFoundError:
+diff --git a/tests/integration_tests/datasets/api_tests.py b/tests/integration_tests/datasets/api_tests.py
+index 75406921..fd1fe2ec 100644
+--- a/tests/integration_tests/datasets/api_tests.py
++++ b/tests/integration_tests/datasets/api_tests.py
+@@ -35,6 +35,7 @@ from sqlalchemy.sql import func
+ from superset.commands.dataset.exceptions import DatasetCreateFailedError
+ from superset.connectors.sqla.models import SqlaTable, SqlMetric, TableColumn
+ from superset.constants import SKIP_VISIBILITY_FILTER_CLASSES
++from superset.exceptions import SupersetGenericDBErrorException
+ from superset.extensions import db, security_manager
+ from superset.models.core import Database
+ from superset.models.slice import Slice
+@@ -1195,6 +1196,34 @@ class TestDatasetApi(SupersetTestCase):
+ 
+         self.items_to_delete = [dataset]
+ 
++    @patch("superset.datasets.api.RefreshDatasetCommand.run")
++    def test_update_dataset_item_w_override_columns_refresh_failure(
++        self, mock_refresh_dataset
++    ):
++        """
++        Dataset API: a failed post-save refresh should not report the update
++        itself as failed because the dataset changes have already committed.
++        """
++
++        dataset = self.insert_default_dataset()
++        self.login(ADMIN_USERNAME)
++        mock_refresh_dataset.side_effect = SupersetGenericDBErrorException(
++            message="Invalid SQL: unexpected EOF"
++        )
++
++        dataset_data = {"description": "changed description"}
++        uri = f"api/v1/dataset/{dataset.id}?override_columns=true"
++        rv = self.put_assert_metric(uri, dataset_data, "put")
++
++        assert rv.status_code == 200
++        response = json.loads(rv.data.decode("utf-8"))
++        assert response["column_sync_error"] == "Invalid SQL: unexpected EOF"
++
++        model = db.session.query(SqlaTable).get(dataset.id)
++        assert model.description == dataset_data["description"]
++
++        self.items_to_delete = [dataset]
++
+     def test_update_dataset_item_w_override_columns_same_columns(self):
+         """
+         Dataset API: Test update dataset with override columns
+diff --git a/tests/unit_tests/datasets/api_tests.py b/tests/unit_tests/datasets/api_tests.py
+index c536fad9..d4df50b0 100644
+--- a/tests/unit_tests/datasets/api_tests.py
++++ b/tests/unit_tests/datasets/api_tests.py
+@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
+ from sqlalchemy.orm.session import Session
+ 
+ from superset import db
++from superset.exceptions import SupersetGenericDBErrorException
+ 
+ 
+ def test_put_invalid_dataset(
+@@ -75,6 +76,54 @@ def test_put_invalid_dataset(
+     }
+ 
+ 
++def test_put_dataset_override_columns_refresh_failure_returns_partial_success(
++    session: Session,
++    client: Any,
++    full_api_access: None,
++) -> None:
++    """
++    A failed post-save refresh should not turn a successful dataset update into
++    a save error response.
++    """
++    from superset.connectors.sqla.models import SqlaTable
++    from superset.models.core import Database
++
++    SqlaTable.metadata.create_all(db.session.get_bind())
++
++    database = Database(
++        database_name="my_db_refresh_failure",
++        sqlalchemy_uri="sqlite://",
++    )
++    dataset = SqlaTable(
++        table_name="test_put_refresh_failure_dataset",
++        database=database,
++        description="before",
++    )
++    db.session.add(dataset)
++    db.session.flush()
++
++    with patch(
++        "superset.commands.dataset.update.security_manager.raise_for_editorship"
++    ), patch(
++        "superset.commands.dataset.update.compute_subjects"
++    ), patch(
++        "superset.datasets.api.RefreshDatasetCommand.run",
++        side_effect=SupersetGenericDBErrorException(
++            message="Invalid SQL: unexpected EOF"
++        ),
++    ):
++        response = client.put(
++            f"/api/v1/dataset/{dataset.id}?override_columns=true",
++            json={"description": "after"},
++        )
++
++    assert response.status_code == 200
++    assert response.json["column_sync_error"] == "Invalid SQL: unexpected EOF"
++
++    db.session.refresh(dataset)
++    assert dataset.description == "after"
++
++
+ def test_get_dataset_include_rendered_sql_passes_table_to_template_processor(
+     session: Session,
+     client: Any,

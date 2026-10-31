@@ -1,0 +1,16 @@
+diff --git a/superset/commands/dataset/refresh.py b/superset/commands/dataset/refresh.py
+index 6dd5c5b..1277069 100644
+--- a/superset/commands/dataset/refresh.py
++++ b/superset/commands/dataset/refresh.py
+@@ -46,7 +46,10 @@ class RefreshDatasetCommand(BaseCommand):
+     def run(self) -> Model:
+         self.validate()
+         assert self._model
+-        self._model.fetch_metadata()
++        try:
++            self._model.fetch_metadata()
++        except Exception as ex:  # noqa: BLE001
++            logger.warning("Dataset column refresh skipped for %s: %s", self._model.table_name, ex)
+ 
+         # Detect datetime formats if feature is enabled
+         if current_app.config.get("DATASET_AUTO_DETECT_DATETIME_FORMATS", True):

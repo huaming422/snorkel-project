@@ -1,0 +1,312 @@
+diff --git a/superset/commands/dataset/create.py b/superset/commands/dataset/create.py
+index 310fa9b2..0ba24a50 100644
+--- a/superset/commands/dataset/create.py
++++ b/superset/commands/dataset/create.py
+@@ -41,6 +41,12 @@ from superset.utils.decorators import on_error, transaction
+ logger = logging.getLogger(__name__)
+ 
+ 
++
++def _sql_contains_jinja(sql: str) -> bool:
++    """Return True if *sql* includes Jinja block/variable/comment markers."""
++    return any(token in sql for token in ("{{", "{%", "{#"))
++
++
+ class CreateDatasetCommand(CreateMixin, BaseCommand):
+     def __init__(self, data: dict[str, Any]):
+         self._properties = data.copy()
+@@ -50,7 +56,19 @@ class CreateDatasetCommand(CreateMixin, BaseCommand):
+         self.validate()
+ 
+         dataset = DatasetDAO.create(attributes=self._properties)
+-        dataset.fetch_metadata()
++        # Metadata discovery is best-effort for virtual datasets. Jinja-templated
++        # SQL often cannot be executed/parsed at create time (no chart filters,
++        # url params, etc.), but the dataset row itself is still valid and should
++        # be saved without surfacing a spurious "Invalid SQL" error.
++        try:
++            dataset.fetch_metadata()
++        except Exception as ex:  # pylint: disable=broad-except
++            logger.warning(
++                "Dataset %s created, but metadata fetch failed: %s",
++                dataset.table_name,
++                ex,
++                exc_info=True,
++            )
+         return dataset
+ 
+     def validate(self) -> None:  # noqa: C901
+@@ -105,12 +123,15 @@ class CreateDatasetCommand(CreateMixin, BaseCommand):
+             except SupersetSecurityException as ex:
+                 exceptions.append(DatasetDataAccessIsNotAllowed(ex.error.message))
+             except SupersetParseError as ex:
+-                exceptions.append(
+-                    ValidationError(
+-                        f"Invalid SQL: {ex.error.message}",
+-                        field_name="sql",
++                # Jinja-templated virtual SQL may not parse until rendered; do not
++                # surface that as a blocking "Invalid SQL" on create.
++                if not _sql_contains_jinja(sql):
++                    exceptions.append(
++                        ValidationError(
++                            f"Invalid SQL: {ex.error.message}",
++                            field_name="sql",
++                        )
+                     )
+-                )
+         elif database:
+             try:
+                 security_manager.raise_for_access(
+diff --git a/superset/commands/dataset/update.py b/superset/commands/dataset/update.py
+index 338603c1..f6b520ab 100644
+--- a/superset/commands/dataset/update.py
++++ b/superset/commands/dataset/update.py
+@@ -68,6 +68,12 @@ DEFAULT_FOLDER_UUIDS = frozenset(
+ )
+ 
+ 
++
++def _sql_contains_jinja(sql: str) -> bool:
++    """Return True if *sql* includes Jinja block/variable/comment markers."""
++    return any(token in sql for token in ("{{", "{%", "{#"))
++
++
+ class UpdateDatasetCommand(UpdateMixin, BaseCommand):
+     def __init__(
+         self,
+@@ -197,12 +203,20 @@ class UpdateDatasetCommand(UpdateMixin, BaseCommand):
+             except SupersetSecurityException as ex:
+                 exceptions.append(DatasetDataAccessIsNotAllowed(ex.error.message))
+             except SupersetParseError as ex:
+-                exceptions.append(
+-                    ValidationError(
+-                        f"Invalid SQL: {ex.error.message}",
+-                        field_name="sql",
++                # Virtual datasets may contain Jinja control-flow (``{% if %}`` /
++                # ``{{ ... }}``) that is only valid once rendered in a chart or
++                # SQL Lab context. raise_for_access parses SQL for table-level
++                # authorization; when the unrendered template cannot be modeled
++                # as SQL, skip the parse error rather than blocking the save
++                # with a spurious "Invalid SQL" — the dataset row itself is
++                # fine, and column sync / query-time rendering handle the rest.
++                if not _sql_contains_jinja(sql):
++                    exceptions.append(
++                        ValidationError(
++                            f"Invalid SQL: {ex.error.message}",
++                            field_name="sql",
++                        )
+                     )
+-                )
+ 
+     def _validate_semantics(self, exceptions: list[ValidationError]) -> None:
+         # we know we have a valid model
+diff --git a/superset/datasets/api.py b/superset/datasets/api.py
+index af1ca2e6..b73ef42b 100644
+--- a/superset/datasets/api.py
++++ b/superset/datasets/api.py
+@@ -650,14 +650,28 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
+                 SqlaTable, changed_model.id, changed_model.uuid
+             )
+             etag_version_uuid = new_info.version_uuid
++            # Column sync runs in a *separate* committed unit of work after the
++            # dataset row itself has already been saved. Failures here (most
++            # commonly Jinja-templated virtual SQL that cannot be rendered or
++            # parsed outside of a chart/query context) must not undo or mask
++            # the successful save — otherwise the editor shows a spurious
++            # "Invalid SQL" error while the user's edits are already persisted.
+             if override_columns:
+-                RefreshDatasetCommand(pk).run()
+-                # The ETag must reflect the entity's *current live* version,
+-                # which after the refresh is the refresh's transaction —
+-                # re-read it rather than reusing the pre-refresh uuid.
+-                etag_version_uuid = current_entity_etag_uuid(
+-                    SqlaTable, changed_model.id, changed_model.uuid
+-                )
++                try:
++                    RefreshDatasetCommand(pk).run()
++                    # The ETag must reflect the entity's *current live* version,
++                    # which after the refresh is the refresh's transaction —
++                    # re-read it rather than reusing the pre-refresh uuid.
++                    etag_version_uuid = current_entity_etag_uuid(
++                        SqlaTable, changed_model.id, changed_model.uuid
++                    )
++                except Exception as ex:  # pylint: disable=broad-except
++                    logger.warning(
++                        "Dataset %s saved, but column sync failed: %s",
++                        pk,
++                        ex,
++                        exc_info=True,
++                    )
+             response = self.response(
+                 200,
+                 id=changed_model.id,
+@@ -676,13 +690,6 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
+             response = self.response_403()
+         except DatasetInvalidError as ex:
+             response = self.response_422(message=ex.normalized_messages())
+-        except DatasetRefreshFailedError as ex:
+-            logger.exception(
+-                "Error refreshing dataset during update %s: %s",
+-                self.__class__.__name__,
+-                str(ex),
+-            )
+-            response = self.response_422(message=str(ex))
+         except DatasetUpdateFailedError as ex:
+             logger.error(
+                 "Error updating model %s: %s",
+diff --git a/tests/unit_tests/commands/dataset/test_create.py b/tests/unit_tests/commands/dataset/test_create.py
+index 75174cf7..7f60d9ac 100644
+--- a/tests/unit_tests/commands/dataset/test_create.py
++++ b/tests/unit_tests/commands/dataset/test_create.py
+@@ -250,3 +250,88 @@ def test_create_dataset_generic_exists_error_when_no_twin() -> None:
+                             )
+                             with pytest.raises(DatasetInvalidError):
+                                 command.validate()
++
++
++def test_create_dataset_jinja_sql_parse_error_is_not_blocking() -> None:
++    """Jinja virtual SQL that cannot be parsed unrendered must not raise Invalid SQL."""
++    mock_database = Mock(spec=Database)
++    mock_database.id = 1
++    mock_database.db_engine_spec.engine = "postgresql"
++    mock_database.get_default_catalog.return_value = None
++
++    jinja_sql = (
++        "SELECT * FROM t WHERE 1=1 "
++        "{% if filter_values('status') %} AND status = 1 {% endif %}"
++    )
++
++    with patch(
++        "superset.commands.dataset.create.DatasetDAO.get_database_by_id",
++        return_value=mock_database,
++    ):
++        with patch(
++            "superset.commands.dataset.create.DatasetDAO.validate_uniqueness",
++            return_value=True,
++        ):
++            with patch(
++                "superset.commands.dataset.create.security_manager.raise_for_access",
++                side_effect=SupersetParseError(
++                    sql=jinja_sql,
++                    engine="postgresql",
++                    message="Error parsing near '{%' at line 1:28",
++                ),
++            ):
++                with patch(
++                    "superset.commands.dataset.create.populate_subjects",
++                    return_value=[],
++                ):
++                    command = CreateDatasetCommand(
++                        {
++                            "database": 1,
++                            "table_name": "jinja_virtual",
++                            "sql": jinja_sql,
++                        }
++                    )
++                    # Should not raise DatasetInvalidError
++                    command.validate()
++
++
++def test_create_dataset_plain_invalid_sql_still_errors() -> None:
++    """Plain (non-Jinja) unparseable SQL must still surface Invalid SQL."""
++    mock_database = Mock(spec=Database)
++    mock_database.id = 1
++    mock_database.db_engine_spec.engine = "postgresql"
++    mock_database.get_default_catalog.return_value = None
++
++    with patch(
++        "superset.commands.dataset.create.DatasetDAO.get_database_by_id",
++        return_value=mock_database,
++    ):
++        with patch(
++            "superset.commands.dataset.create.DatasetDAO.validate_uniqueness",
++            return_value=True,
++        ):
++            with patch(
++                "superset.commands.dataset.create.security_manager.raise_for_access",
++                side_effect=SupersetParseError(
++                    sql="SELECT INVALID",
++                    engine="postgresql",
++                    message="Invalid SQL syntax",
++                ),
++            ):
++                with patch(
++                    "superset.commands.dataset.create.populate_subjects",
++                    return_value=[],
++                ):
++                    command = CreateDatasetCommand(
++                        {
++                            "database": 1,
++                            "table_name": "bad_sql",
++                            "sql": "SELECT INVALID",
++                        }
++                    )
++                    with pytest.raises(DatasetInvalidError) as exc_info:
++                        command.validate()
++                    assert any(
++                        "Invalid SQL:" in str(err.messages[0])
++                        for err in exc_info.value._exceptions
++                    )
+diff --git a/tests/unit_tests/commands/dataset/update_test.py b/tests/unit_tests/commands/dataset/update_test.py
+index d4742ebd..84af8a0b 100644
+--- a/tests/unit_tests/commands/dataset/update_test.py
++++ b/tests/unit_tests/commands/dataset/update_test.py
+@@ -37,7 +37,7 @@ from superset.commands.dataset.update import (
+ )
+ from superset.datasets.schemas import FolderSchema
+ from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
+-from superset.exceptions import SupersetSecurityException
++from superset.exceptions import SupersetParseError, SupersetSecurityException
+ from superset.subjects.exceptions import SubjectsNotFoundValidationError
+ from tests.unit_tests.conftest import with_feature_flags
+ 
+@@ -1115,3 +1115,49 @@ def test_validate_folders_metrics_vs_columns_behavior(mocker: MockerFixture) ->
+         command2._validate_semantics([])
+     except Exception as e:
+         pytest.fail(f"Should work with new metric UUIDs when new metrics provided: {e}")
++
++
++def test_update_dataset_jinja_sql_parse_error_is_not_blocking(
++    mocker: MockerFixture,
++) -> None:
++    """Jinja virtual SQL parse failures must not block dataset updates."""
++    mock_dataset_dao = mocker.patch("superset.commands.dataset.update.DatasetDAO")
++    mock_database = mocker.MagicMock()
++    mock_database.id = 1
++    mock_database.get_default_catalog.return_value = "catalog"
++    mock_database.allow_multi_catalog = False
++
++    mock_dataset = mocker.MagicMock()
++    mock_dataset.database = mock_database
++    mock_dataset.catalog = "catalog"
++    mock_dataset.schema = "public"
++    mock_dataset.table_name = "test_table"
++    mock_dataset.sql = "SELECT 1"
++    mock_dataset.editors = []
++
++    mock_dataset_dao.find_by_id.return_value = mock_dataset
++    mock_dataset_dao.get_database_by_id.return_value = mock_database
++    mock_dataset_dao.validate_update_uniqueness.return_value = True
++    mock_dataset_dao.update.return_value = mock_dataset
++
++    mocker.patch(
++        "superset.commands.dataset.update.security_manager.raise_for_editorship",
++    )
++    mocker.patch("superset.commands.utils.security_manager.is_admin", return_value=True)
++
++    jinja_sql = (
++        "SELECT * FROM t WHERE 1=1 "
++        "{% if filter_values('status') %} AND status = 1 {% endif %}"
++    )
++    mocker.patch(
++        "superset.commands.dataset.update.security_manager.raise_for_access",
++        side_effect=SupersetParseError(
++            sql=jinja_sql,
++            engine="postgresql",
++            message="Error parsing near '{%' at line 1:28",
++        ),
++    )
++
++    result = UpdateDatasetCommand(1, {"sql": jinja_sql}).run()
++    assert result == mock_dataset
++    mock_dataset_dao.update.assert_called_once()

@@ -1,0 +1,143 @@
+diff --git a/superset/commands/dataset/refresh.py b/superset/commands/dataset/refresh.py
+index 6dd5c5b..689ccb7 100644
+--- a/superset/commands/dataset/refresh.py
++++ b/superset/commands/dataset/refresh.py
+@@ -31,7 +31,10 @@ from superset.commands.dataset.exceptions import (
+ from superset.connectors.sqla.models import SqlaTable
+ from superset.daos.dataset import DatasetDAO
+ from superset.datasets.datetime_format_detector import DatetimeFormatDetector
+-from superset.exceptions import SupersetSecurityException
++from superset.exceptions import (
++    SupersetSecurityException,
++    SupersetVirtualTableParseException,
++)
+ from superset.utils.decorators import on_error, transaction
+ 
+ logger = logging.getLogger(__name__)
+@@ -46,7 +49,22 @@ class RefreshDatasetCommand(BaseCommand):
+     def run(self) -> Model:
+         self.validate()
+         assert self._model
+-        self._model.fetch_metadata()
++        try:
++            self._model.fetch_metadata()
++        except SupersetVirtualTableParseException as ex:
++            # The virtual dataset's SQL could not be parsed or templated at
++            # save time - typically Jinja blocks (e.g. ``{% if from_dttm %}``)
++            # that have no runtime context here. The row has already been
++            # persisted by ``UpdateDatasetCommand`` before this refresh runs,
++            # so surfacing an "Invalid SQL" toast is misleading. Genuine
++            # driver, connection, and permission errors still raise the
++            # broader ``SupersetGenericDBErrorException`` and continue to
++            # bubble up. See #38012.
++            logger.warning(
++                "Dataset column refresh skipped for %s: %s",
++                self._model.table_name,
++                ex.message,
++            )
+ 
+         # Detect datetime formats if feature is enabled
+         if current_app.config.get("DATASET_AUTO_DETECT_DATETIME_FORMATS", True):
+diff --git a/superset/connectors/sqla/utils.py b/superset/connectors/sqla/utils.py
+index 106d024..6182b36 100644
+--- a/superset/connectors/sqla/utils.py
++++ b/superset/connectors/sqla/utils.py
+@@ -23,6 +23,7 @@ from typing import Callable, TYPE_CHECKING, TypeVar
+ from uuid import UUID
+ 
+ from flask_babel import lazy_gettext as _
++from jinja2 import UndefinedError
+ from sqlalchemy.engine.url import URL as SqlaURL  # noqa: N811
+ from sqlalchemy.exc import NoSuchTableError
+ from sqlalchemy.orm import DeclarativeMeta
+@@ -37,6 +38,7 @@ from superset.exceptions import (
+     SupersetParseError,
+     SupersetSecurityException,
+     SupersetSyntaxErrorException,
++    SupersetVirtualTableParseException,
+ )
+ from superset.models.core import Database
+ from superset.result_set import SupersetResultSet
+@@ -96,6 +98,11 @@ def get_physical_table_metadata(
+     return cols
+ 
+ 
++def _has_jinja_markers(sql: str) -> bool:
++    """Return True if ``sql`` contains Jinja template markers (``{%`` or ``{{``)."""
++    return "{%" in sql or "{{" in sql
++
++
+ def get_virtual_table_metadata(dataset: SqlaTable) -> list[ResultSetColumnType]:
+     """Use SQLparser to get virtual dataset metadata"""
+     if not dataset.sql:
+@@ -104,17 +111,48 @@ def get_virtual_table_metadata(dataset: SqlaTable) -> list[ResultSetColumnType]:
+         )
+ 
+     db_engine_spec = dataset.database.db_engine_spec
++    original_sql = dataset.sql
+     try:
+         sql = dataset.get_template_processor().process_template(
+-            dataset.sql, **dataset.template_params_dict
++            original_sql, **dataset.template_params_dict
+         )
++    except UndefinedError as ex:
++        # ``template.render()`` runs outside ``process_template``'s own error
++        # handling, so a template that touches a variable with no value at
++        # save time (e.g. ``{{ from_dttm.isoformat() }}``) surfaces here as
++        # the bare jinja2 error. That is a "missing runtime context" signal
++        # that ``RefreshDatasetCommand`` can safely soften. See #38012.
++        raise SupersetVirtualTableParseException(
++            message=_("Template processing error: %(error)s", error=str(ex)),
++        ) from ex
+     except SupersetSyntaxErrorException as ex:
++        # Errors raised while compiling the template come back wrapped, with
++        # the jinja2 error on ``__cause__``. Only the ``UndefinedError`` case
++        # is a "missing runtime context" signal - the rest (sandbox
++        # violations, malformed template syntax, encoding errors) indicate a
++        # real problem with the template that must surface. See #38012.
++        if isinstance(ex.__cause__, UndefinedError):
++            raise SupersetVirtualTableParseException(
++                message=_("Template processing error: %(error)s", error=str(ex)),
++            ) from ex
+         raise SupersetGenericDBErrorException(
+             message=_("Template processing error: %(error)s", error=str(ex)),
+         ) from ex
+     try:
+         parsed_script = SQLScript(sql, engine=db_engine_spec.engine)
+     except SupersetParseError as ex:
++        # ``SQLScript`` fails on any invalid SQL, including static SQL
++        # with no template dependency. Only soften when the input
++        # contained Jinja markers - in that case an "Invalid SQL"
++        # outcome is very likely a rendering artifact (e.g. an empty
++        # ``filter_values('x')`` producing ``WHERE col IN ()``) rather
++        # than a genuine defect in the user's SQL, and the row is
++        # already persisted by ``UpdateDatasetCommand``. Genuinely
++        # invalid static SQL must still hard-error. See #38012.
++        if _has_jinja_markers(original_sql):
++            raise SupersetVirtualTableParseException(
++                message=_("Invalid SQL: %(error)s", error=ex.error.message),
++            ) from ex
+         raise SupersetGenericDBErrorException(
+             message=_("Invalid SQL: %(error)s", error=ex.error.message),
+         ) from ex
+diff --git a/superset/exceptions.py b/superset/exceptions.py
+index be21c4a..2fe5b9a 100644
+--- a/superset/exceptions.py
++++ b/superset/exceptions.py
+@@ -147,6 +147,16 @@ class SupersetGenericDBErrorException(SupersetErrorFromParamsException):
+         )
+ 
+ 
++class SupersetVirtualTableParseException(SupersetGenericDBErrorException):
++    """Raised when a virtual dataset's SQL cannot be parsed/templated.
++
++    Distinct from generic DB errors so callers can soften template/parse
++    failures (which cannot be validated at save time without runtime
++    context) without also swallowing genuine driver, connection, or
++    permission errors from the same code path. See #38012.
++    """
++
++
+ class SupersetTemplateParamsErrorException(SupersetErrorFromParamsException):
+     status = 400
+ 

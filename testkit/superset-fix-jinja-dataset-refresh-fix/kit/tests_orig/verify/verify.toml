@@ -1,0 +1,24 @@
+# Verifier runner configuration.
+#
+# verify.py imports the repository package (superset) and drives the dataset
+# editor's save through the real HTTP endpoint (PUT /api/v1/dataset/<pk>) using
+# Flask's test client, so pytest must run under the REPOSITORY's own
+# interpreter — the base image's system python (/usr/local/bin/python3, 3.11),
+# which is where the locked superset dependency closure is installed at the
+# base commit (see image/Dockerfile). This override applies only to the pytest
+# child process; the shared grading harness still runs under the isolated
+# verifier venv.
+#
+# cwd is the repo root (/repo/superset), set by the runner, so `python3`
+# resolves to the repo interpreter on PATH.
+#
+# Timeout: the module-scoped app fixture does a one-time bootstrap of a real
+# metadata DB — `flask db upgrade` over the full alembic migration tree plus
+# FAB role/permission sync and an admin user — against a file-backed SQLite DB
+# (the integration-test bootstrap, in-process and offline). That one-time setup
+# is the dominant cost (~30s measured warm); the eight HTTP tests then each
+# issue a single PUT in milliseconds. 600s is generous headroom over the
+# measured run and stays well inside the 20-minute reward-stack budget.
+[pytest]
+command = "python3 -m pytest"
+timeout = 600

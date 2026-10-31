@@ -1,0 +1,44 @@
+{
+  "files": [
+    "superset/connectors/sqla/utils.py",
+    "superset/commands/dataset/refresh.py",
+    "superset/exceptions.py",
+    "superset/datasets/api.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "saving_a_virtual_dataset_whose_jinja_sql_fails_to_render_(un",
+      "description": "Saving a virtual dataset whose Jinja SQL fails to render (undefined template variable) is best-effort: the save succeeds and the edit persists, with no spurious error"
+    },
+    {
+      "name": "saving_a_virtual_dataset_whose_jinja-templated_sql_renders_t",
+      "description": "Saving a virtual dataset whose Jinja-templated SQL renders to unparseable SQL is best-effort (save succeeds, edit persists)"
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "a_genuine_db/driver/connection_error_during_the_post-save_re",
+      "description": "A genuine DB/driver/connection error during the post-save refresh still surfaces as a hard HTTP error, even when the dataset's SQL also contains Jinja markers"
+    },
+    {
+      "name": "a_save_of_a_plain_static_(non-jinja)_virtual_dataset_with_ge",
+      "description": "A save of a PLAIN static (non-Jinja) virtual dataset with genuinely invalid SQL still fails with a hard HTTP error (is NOT softened)"
+    },
+    {
+      "name": "a_template_failure_caused_by_a_sandbox/security_violation_(n",
+      "description": "A template failure caused by a sandbox/security violation (not an undefined variable) during the post-save refresh still fails the save with a hard HTTP error and is NOT softened"
+    },
+    {
+      "name": "pre-existing_validation_paths_are_unchanged:_saving_an_unkno",
+      "description": "Pre-existing validation paths are unchanged: saving an unknown dataset still returns not-found (404)"
+    },
+    {
+      "name": "saving_a_plain,_valid_virtual-dataset_sql_still_succeeds_cle",
+      "description": "Saving a plain, valid virtual-dataset SQL still succeeds cleanly (happy-path regression guard)"
+    },
+    {
+      "name": "existing_callers_that_catch_the_generic_db_error_for_virtual",
+      "description": "Existing callers that catch the generic DB error for virtual-table metadata keep working unchanged (no behavior change for non-refresh callers)"
+    }
+  ]
+}

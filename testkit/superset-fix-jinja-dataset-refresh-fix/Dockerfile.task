@@ -1,0 +1,93 @@
+# Pre-fix commit: 2f9bde55797627288297207e43d32c0abd9306ec
+# apache/superset - post-save dataset column refresh (virtual/Jinja datasets)
+
+FROM python:3.11.13-slim-bookworm
+# Pipes inside RUN fail loudly: without pipefail a failing `curl` before `| sh`
+# is invisible and the image "builds" without the tool.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_INPUT=1
+
+# Test runners size worker pools from the visible CPU count, so peak memory
+# scales with the host, not with the task's declared resources. Cap the runner
+# pools to the task.toml cpus (4 here) so the declared memory bound holds on any
+# host. Only runner-pool knobs live here; MAKEFLAGS is never set (inherited by
+# nested make, breaks native builds).
+# caps-skip: TURBO_CONCURRENCY, VITEST_MAX_THREADS, VITEST_MIN_THREADS, GOMAXPROCS, CARGO_BUILD_JOBS, RUST_TEST_THREADS, CMAKE_BUILD_PARALLEL_LEVEL - pure-Python backend task; no JS/Go/Rust/CMake build or test runner is exercised.
+ENV PYTEST_XDIST_AUTO_NUM_WORKERS=4
+
+# System packages: git/curl for clone + toolchain install; build toolchain and
+# the C-extension headers Superset's locked dev deps compile against:
+#   - libldap2-dev / libsasl2-dev : python-ldap compiles from source
+#   - libssl-dev / libffi-dev     : gevent/greenlet/cffi link against libssl/libffi
+#   - libpq-dev                   : psycopg2 (Postgres driver) builds from source
+#   - default-libmysqlclient-dev  : mysqlclient builds from source and needs the
+#                                   MySQL client pkg-config/ldflags
+#   - libxml2-dev / libxmlsec1-dev / libxmlsec1-openssl : python3-saml / xmlsec
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl xz-utils \
+        build-essential pkg-config \
+        libldap2-dev libsasl2-dev libssl-dev libffi-dev \
+        libpq-dev default-libmysqlclient-dev \
+        libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Canonical verifier runtime. Insert after apt/system packages and before the
+# repository language toolchain so same-repo images share the layer. The pins
+# are src/resources/verifier-requirements.txt inlined. BUILD_DATE freezes their
+# transitive resolution (UV_EXCLUDE_NEWER, this install only).
+ARG BUILD_DATE=2026-09-24
+RUN curl -LsSf https://astral.sh/uv/0.11.26/install.sh | env UV_INSTALL_DIR=/opt/tooling/uv UV_NO_MODIFY_PATH=1 sh \
+ && export UV_PYTHON_INSTALL_DIR=/opt/tooling/python UV_NO_CACHE=1 \
+ && /opt/tooling/uv/uv python install 3.12 \
+ && /opt/tooling/uv/uv venv --managed-python --python 3.12 /opt/tooling/venv \
+ && UV_EXCLUDE_NEWER=${BUILD_DATE} /opt/tooling/uv/uv pip install --python /opt/tooling/venv/bin/python \
+    pytest==9.1.1 requests==2.34.2 jinja2==3.1.6 litellm==1.93.0 pydantic==2.13.4 \
+    unidiff==0.7.5 pygments==2.20.0 ast-grep-py==0.44.1 mini-swe-agent==2.4.5 portkey-ai==2.3.3 \
+ && LITELLM_LOCAL_MODEL_COST_MAP=True /opt/tooling/venv/bin/python -c "import ast_grep_py, jinja2, litellm, minisweagent, portkey_ai, pydantic, pygments, pytest, requests, unidiff"
+
+# Language toolchain: the repository's Python is the base image's own 3.11
+# interpreter (`requires-python >= 3.11`); no separate toolchain download is
+# needed. `python3` -> /usr/local/bin/python3 (3.11.13).
+
+# Clone -> fetch the pinned commit -> rewind -> scrub -> bake the locked
+# dependency closure (offline agent phase: the image must carry every dep the
+# agent or verifier needs) -> baseline-commit, all in ONE layer.
+RUN git clone --depth=1 --single-branch --no-tags -b master \
+        https://github.com/apache/superset.git /repo/superset && \
+    cd /repo/superset && \
+    git fetch --depth=1000 origin 2f9bde55797627288297207e43d32c0abd9306ec && \
+    git reset --hard 2f9bde55797627288297207e43d32c0abd9306ec && \
+    git remote remove origin && rm -rf .git/refs/remotes && \
+    rm -f .git/FETCH_HEAD .git/ORIG_HEAD && \
+    git reflog expire --expire=now --all && \
+    git gc --prune=now && \
+    # Bake the locked dependency closure (requirements/development.txt pins
+    # exact versions and includes `-e .`, superset-core, the extensions CLI,
+    # and the test tooling pytest==7.4.4 / pytest-mock==3.10.0). Bare (no
+    # redirect/silencing): pip prints to the build log and a non-zero exit
+    # aborts the build.
+    python3 -m pip install --no-cache-dir -r requirements/development.txt && \
+    # Prove the dependency closure resolves offline. `import superset` pulls
+    # the templating/SQL/ORM stack transitively but instantiates no app, so it
+    # is safe at build time. The model/command modules the verifier touches
+    # (superset.models.core and below) build encrypted-field columns at
+    # class-definition time and raise unless an app has already run init_app -
+    # so they are imported lazily, after init_app(), by the verifier's app
+    # fixture at test time, never here. This mirrors the repo's own test suite,
+    # which only imports those modules under its app-initialized conftest.
+    python3 -c "import superset" && \
+    # Base checkpoint for diff tracking. Snapshot build-time working-tree
+    # changes (e.g. superset/static/version_info.json written by setup.py)
+    # under a devcontainer identity so the grading diff (base..HEAD)
+    # is only the agent's edits.
+    git add -A && \
+    if ! git diff --cached --quiet; then \
+        git -c user.email=automation@localhost -c user.name=devcontainer \
+            commit -m 'chore: initialize dev environment' --no-gpg-sign; \
+    fi && \
+    git rev-parse HEAD > /var/lib/devcontainer_base_ref
+WORKDIR /repo/superset

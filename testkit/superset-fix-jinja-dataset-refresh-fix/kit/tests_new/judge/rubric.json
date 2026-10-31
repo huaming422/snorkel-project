@@ -1,0 +1,15 @@
+{
+  "files": [
+    "superset/connectors/sqla/utils.py",
+    "superset/commands/dataset/refresh.py",
+    "superset/exceptions.py",
+    "superset/datasets/api.py"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": [
+    {
+      "name": "existing_generic_catchers_unaffected",
+      "description": "Making the post-save column-metadata refresh best-effort for Jinja template/parse failures must not change what EXISTING broad catchers of the generic virtual-table-metadata DB error observe. Several callers elsewhere in the codebase (for example the model-level external-metadata consumer in superset/connectors/sqla/models.py, which catches the generic DB error around virtual-table metadata) rely on being able to catch that generic error for a virtual dataset whose SQL fails to template or parse. A correct solution keeps the softened template/parse failures catchable by those pre-existing handlers exactly as before - i.e. the error the refresh now treats as non-fatal is still, from any other caller's point of view, a generic virtual-table-metadata DB error (an 'is-a' relationship preserved). Accept ANY implementation that preserves this: introducing a dedicated subclass of the generic DB error; or not introducing a new type at all and instead having the refresh inspect the caught error's cause/attributes; or flagging the soften-able case via an attribute the refresh reads. What must NOT happen: the soften-able failure is turned into a brand-new error type that is NOT a kind of the pre-existing generic DB error (so existing `except GenericDBError` handlers stop catching it), or the generic error is suppressed/relabelled at the metadata layer in a way that changes behavior for non-refresh callers. Judge only the preservation of the existing catch relationship for non-refresh callers; the refresh command's own best-effort behavior is covered elsewhere and is not what this criterion scores."
+    }
+  ]
+}
