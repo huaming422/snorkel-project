@@ -21,19 +21,21 @@ Expected outcomes:
     plain, valid SQL                                 -> success (200)
     unknown dataset id                               -> 404
 
-The undefined variable row turns on ENABLE_TEMPLATE_PROCESSING for that save
-only, so the SQL goes through Superset's real Jinja processor. The sandbox
-row patches the existing SqlaTable.get_template_processor seam and raises a
-jinja2 SecurityError both bare and wrapped in SupersetSyntaxErrorException,
-the two forms a template error can take in this codebase. The generic DB
-error row patches the existing SqlaTable.fetch_metadata seam. The parse rows
-use real SQL with no patching.
+The undefined variable row and the {% if %} case of the Jinja parse row turn
+on ENABLE_TEMPLATE_PROCESSING for that save only, so the SQL goes through
+Superset's real Jinja processor. The sandbox row patches the existing
+SqlaTable.get_template_processor seam and raises a jinja2 SecurityError both
+bare and wrapped in SupersetSyntaxErrorException, the two forms a template
+error can take in this codebase. The generic DB error row patches the
+existing SqlaTable.fetch_metadata seam. The parse rows use real SQL and patch
+no seam.
 """
 
 from __future__ import annotations
 
 import os
 import uuid
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
@@ -288,15 +290,28 @@ def test_save_is_best_effort_on_undefined_template_variable(client):
 def test_save_is_best_effort_on_jinja_marked_parse_failure(client):
     """SQL that contains Jinja markers and renders, with no runtime context,
     to something the parser rejects must not fail the save. That SQL only
-    resolves at query time."""
-    pk = _make_virtual_dataset(
-        "SELECT INVALID SYNTAX FROM {{ some_table }}", columns=EXISTING_COLUMNS
+    resolves at query time. One case uses {{ ... }} markers. The other uses
+    only a {% if %} block, rendered by the real Jinja processor, which leaves
+    "ds >" with nothing after it when from_dttm has no value."""
+    cases = (
+        ("expression", "SELECT INVALID SYNTAX FROM {{ some_table }}", False),
+        (
+            "block",
+            "SELECT ds, amount FROM t WHERE ds > "
+            "{% if from_dttm %}'2024-01-01'{% endif %}",
+            True,
+        ),
     )
-    resp = _save(client, pk, description="jinja-parse-save")
-    _assert_best_effort_save(
-        pk, resp, "jinja-parse-save",
-        "a Jinja-templated dataset whose rendered SQL fails to parse",
-    )
+    for name, sql, render in cases:
+        pk = _make_virtual_dataset(sql, columns=EXISTING_COLUMNS)
+        description = f"jinja-parse-save-{name}"
+        with _template_processing_enabled() if render else nullcontext():
+            resp = _save(client, pk, description=description)
+        _assert_best_effort_save(
+            pk, resp, description,
+            f"a Jinja-templated dataset ({name} markers) whose rendered SQL "
+            "fails to parse",
+        )
 
 
 # ---------------------------------------------------------------------------

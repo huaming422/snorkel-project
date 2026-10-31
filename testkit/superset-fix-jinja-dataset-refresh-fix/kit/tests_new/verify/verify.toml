@@ -17,7 +17,7 @@
 # FAB role/permission sync and an admin user - against a file-backed SQLite DB
 # (the integration-test bootstrap, in-process and offline). That one-time setup
 # is the dominant cost (~30s measured warm); the seven tests then issue
-# at most eight PUTs in total, each in milliseconds. 600s leaves plenty of room
+# at most nine PUTs in total, each in milliseconds. 600s leaves plenty of room
 # over the measured run and stays inside the 1200s verifier timeout in task.toml.
 [pytest]
 command = "python3 -m pytest"

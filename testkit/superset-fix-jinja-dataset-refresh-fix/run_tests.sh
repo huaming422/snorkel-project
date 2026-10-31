@@ -14,7 +14,7 @@ run() {
   docker run --rm --network none --cpus 4 --memory 8g superset-jinja-kit:latest bash /kit/inner.sh "$1" "$2"
 }
 {
-  for c in nop oracle oracle_old gpt grok opus empty_columns no_marker_check soften_any_template_error catch_all alt_cause_check; do
+  for c in nop oracle oracle_old gpt grok opus empty_columns no_marker_check soften_any_template_error double_brace_only catch_all alt_cause_check; do
     run tests_new "$c"
   done
   for c in nop oracle_old oracle; do

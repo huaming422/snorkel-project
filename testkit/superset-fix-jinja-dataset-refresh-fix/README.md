@@ -23,6 +23,7 @@ Runs the full tests/test.sh in the task image (built from the upload's environme
 | empty_columns | the reference, but the softened cases return an empty column list instead of raising |
 | no_marker_check | the reference, but every parse failure is softened, Jinja markers or not |
 | soften_any_template_error | the reference, but any jinja2 TemplateError (sandbox errors too) is softened |
+| double_brace_only | the reference, but Jinja is detected by `{{` only, so `{% if %}`-only SQL is not softened |
 | catch_all | no reference; the refresh command swallows every exception from fetch_metadata |
 | alt_cause_check | a valid alternative: no new exception class, the refresh command inspects the error's cause |
 
@@ -39,6 +40,7 @@ Runs the full tests/test.sh in the task image (built from the upload's environme
 | tests_new | empty_columns | reward 0.0, 5 of 7, both test_save_is_best_effort_* tests fail on the column check |
 | tests_new | no_marker_check | reward 0.0, 6 of 7, fails test_save_still_hard_errors_on_static_sql_parse_failure |
 | tests_new | soften_any_template_error | reward 0.0, 6 of 7, fails test_save_still_hard_errors_on_template_security_violation |
+| tests_new | double_brace_only | reward 0.0, 6 of 7, fails test_save_is_best_effort_on_jinja_marked_parse_failure (the block case) |
 | tests_new | catch_all | reward 0.0, 4 of 7, same three as gpt |
 | tests_new | alt_cause_check | reward 1.0, 7 of 7 |
 | tests_orig | nop | reward 0.0, 5 of 7, fails both test_save_is_best_effort_* tests |
