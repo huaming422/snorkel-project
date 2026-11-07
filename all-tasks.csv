@@ -115,7 +115,7 @@ d05d2e9e-a1dd-42b6-9e53-f12486d2ca90,jint-fix-host-collection-index-fix_submissi
 f2ab2cf7-7560-4f1e-820b-61eb7216bfda,beads-fix-json-wire-contracts-fix_submission.zip,28/10/2026 22:45,3,Submission,Fix,Fixable,yes,no,
 e4c17818-c40a-47b1-b99a-5f271be8370c,openai-agents-js-fix-resume-ownership-fix_submission.zip,28/10/2026 22:05,5,Submission,Fix,Fixable,no,no,
 4984f97b-e554-406a-87f6-0a11d639ad07,hermes-lcm-fix-replay-data-loss-fix_submission.zip,28/10/2026 21:15,4,Submission,Fix,Fixable,yes,no,
-717d67bd-79af-4b30-b679-03c4dc00cbe7,beads-fix-dotted-key-roundtrip-fix_submission.zip,28/10/2026 19:51,unknown,Submission,Fix,Fixable,no,no,
+717d67bd-79af-4b30-b679-03c4dc00cbe7,beads-fix-dotted-key-roundtrip-fix_submission.zip,28/10/2026 19:51,unknown,Submission,Fix,Fixable,no,no,Same ID in both sections because the folder is in submitter-tasks and reviewer-tasks
 c37f9c1c-4029-4be5-8709-b30e97741b38,beads-fix-migration-survives-drift-fix_submission.zip,28/10/2026 19:00,5,Submission,Fix,Fixable,yes,no,
 a033f79f-8ff4-423c-822e-b50d391d0c60,not found,28/10/2026 18:01,3,Submission,unknown,unknown,no,no,
 not found,beads-fix-github-push-dedup-fix_submission.zip,28/10/2026 17:51,unknown,Submission,Fix,Fixable,no,no,
@@ -489,7 +489,7 @@ d01899b4-5985-456e-9df8-5272a7505991,typescript-sdk-fix-elicit-schema-conversion
 25dd4744-91ce-41a7-99ed-7b20c758ba46,lexical-migrate-selection-timing-feature_submission.zip,28/10/2026 20:56,1,Review,Feature,Fixable,yes,no,
 3318fea1-4dcb-4a6d-b6e6-c8ba48f335ed,jint-fix-noindex-host-collection-fix_submission.zip,28/10/2026 20:35,1,Review,Fix,Fixable,no,no,
 ba20c48d-baae-4f78-985d-22d856fb8f5a,typescript-sdk-fix-tool-result-content-fix_submission.zip,28/10/2026 20:08,1,Review,Fix,Fixable,no,no,
-717d67bd-79af-4b30-b679-03c4dc00cbe7,beads-fix-dotted-key-roundtrip-fix_submission.zip,28/10/2026 19:51,unknown,Review,Fix,Fixable,no,no,
+717d67bd-79af-4b30-b679-03c4dc00cbe7,beads-fix-dotted-key-roundtrip-fix_submission.zip,28/10/2026 19:51,unknown,Review,Fix,Fixable,no,no,Same ID in both sections because the folder is in submitter-tasks and reviewer-tasks
 8f136396-2c45-4fe0-8641-6b0de55c8ffb,not found,28/10/2026 19:50,1,Review,unknown,unknown,no,no,
 3395ee4c-75fe-430f-b7b6-5e80b3a37cf4,portless-feat-service-install-config-feature_submission.zip,28/10/2026 19:30,1,Review,Feature,Fixable,yes,no,
 16c37c00-8ca5-4ecb-bc3f-66fedd6a380e,ironrdp-fix-zgfx-untrusted-decode-fix_submission.zip,28/10/2026 18:50,1,Review,Fix,Fixable,yes,no,
